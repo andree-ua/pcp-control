@@ -19,8 +19,28 @@ if (!configuredApiUrl && process.env.NODE_ENV === "production") {
 
 export const SERVER_URL = (configuredApiUrl || "http://localhost:5000").replace(/\/+$/, "");
 
+/**
+ * Marca la sesión como inválida. El AuthProvider escucha este evento y redirige
+ * al login; así ningún fetch individual tiene que conocer el router de Next.
+ */
+function notifyUnauthorized(): void {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event("pcp:unauthorized"));
+  }
+}
+
+async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const response = await fetch(input, init);
+
+  if (response.status === 401) {
+    notifyUnauthorized();
+  }
+
+  return response;
+}
+
 export async function fetchScreens(): Promise<ScreenInfo[]> {
-  const response = await fetch(`${SERVER_URL}/api/screens`, {
+  const response = await apiFetch(`${SERVER_URL}/api/screens`, {
     cache: "no-store",
     credentials: "include",
     headers: {
@@ -39,7 +59,7 @@ export async function sendScreenCommand(
   screenId: string,
   request: CommandRequest
 ): Promise<CommandResponse> {
-  const response = await fetch(`${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/command`, {
+  const response = await apiFetch(`${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/command`, {
     method: "POST",
     credentials: "include",
     headers: {
@@ -65,7 +85,7 @@ export async function fetchFiles(screenId: string, path?: string): Promise<FileL
   }
 
   const query = params.toString();
-  const response = await fetch(
+  const response = await apiFetch(
     `${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/files${query ? `?${query}` : ""}`,
     {
       cache: "no-store",
@@ -83,7 +103,7 @@ export async function fetchFiles(screenId: string, path?: string): Promise<FileL
 }
 
 export async function deleteFile(screenId: string, path: string): Promise<void> {
-  const response = await fetch(
+  const response = await apiFetch(
     `${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/files?path=${encodeURIComponent(path)}`,
     {
       method: "DELETE",
@@ -163,6 +183,10 @@ export function uploadFileWithProgress(
         data = null;
       }
 
+      if (xhr.status === 401) {
+        notifyUnauthorized();
+      }
+
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve(data as FileOperationResponse);
         return;
@@ -210,7 +234,7 @@ export async function uploadFile(
 }
 
 export async function fetchGroups(): Promise<GroupInfo[]> {
-  const response = await fetch(`${SERVER_URL}/api/groups`, {
+  const response = await apiFetch(`${SERVER_URL}/api/groups`, {
     cache: "no-store",
     credentials: "include",
   });
@@ -225,7 +249,7 @@ export async function fetchGroups(): Promise<GroupInfo[]> {
 }
 
 export async function createGroup(payload: GroupUpsert): Promise<GroupInfo> {
-  const response = await fetch(`${SERVER_URL}/api/groups`, {
+  const response = await apiFetch(`${SERVER_URL}/api/groups`, {
     method: "POST",
     credentials: "include",
     headers: {
@@ -244,7 +268,7 @@ export async function createGroup(payload: GroupUpsert): Promise<GroupInfo> {
 }
 
 export async function updateGroup(groupId: string, payload: GroupUpsert): Promise<GroupInfo> {
-  const response = await fetch(`${SERVER_URL}/api/groups/${encodeURIComponent(groupId)}`, {
+  const response = await apiFetch(`${SERVER_URL}/api/groups/${encodeURIComponent(groupId)}`, {
     method: "PUT",
     credentials: "include",
     headers: {
@@ -263,7 +287,7 @@ export async function updateGroup(groupId: string, payload: GroupUpsert): Promis
 }
 
 export async function deleteGroup(groupId: string): Promise<void> {
-  const response = await fetch(`${SERVER_URL}/api/groups/${encodeURIComponent(groupId)}`, {
+  const response = await apiFetch(`${SERVER_URL}/api/groups/${encodeURIComponent(groupId)}`, {
     method: "DELETE",
     credentials: "include",
   });
@@ -278,7 +302,7 @@ export async function sendGroupCommand(
   groupId: string,
   request: CommandRequest
 ): Promise<GroupCommandResponse> {
-  const response = await fetch(
+  const response = await apiFetch(
     `${SERVER_URL}/api/groups/${encodeURIComponent(groupId)}/command`,
     {
       method: "POST",
@@ -307,7 +331,7 @@ export async function startRemoteSession(
   screenId: string,
   viewOnly = false
 ): Promise<RemoteSession> {
-  const response = await fetch(
+  const response = await apiFetch(
     `${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/remote/start`,
     {
       method: "POST",
@@ -369,7 +393,7 @@ export function resolveVncSocketUrl(session: RemoteSession): string {
  */
 export async function stopRemoteSession(screenId: string, sessionId?: string): Promise<void> {
   try {
-    await fetch(`${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/remote/stop`, {
+    await apiFetch(`${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/remote/stop`, {
       method: "POST",
       credentials: "include",
       headers: {

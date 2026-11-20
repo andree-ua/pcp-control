@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Pcp.Server.Data;
@@ -12,6 +13,7 @@ namespace Pcp.Server.Controllers;
 /// Controlador API REST para consulta y administración remota de pantallas.
 /// </summary>
 [ApiController]
+[Authorize(Roles = "Admin,Viewer")]
 [Route("api/screens")]
 public class ScreensController : ControllerBase
 {
@@ -105,6 +107,7 @@ public class ScreensController : ControllerBase
     /// Registra una nueva pantalla o actualiza el nombre de una existente.
     /// </summary>
     [HttpPost("register")]
+    [AllowAnonymous]
     public async Task<IActionResult> Register([FromBody] RegisterDto dto)
     {
         if (string.IsNullOrWhiteSpace(dto.ScreenId))
@@ -130,6 +133,15 @@ public class ScreensController : ControllerBase
         }
         else
         {
+            // El agente debe demostrar que conoce el token de la pantalla antes de
+            // modificar su nombre. Sin esta comprobación cualquiera podría renombrarla.
+            var provided = string.IsNullOrWhiteSpace(dto.Token) ? "dev-token" : dto.Token;
+            if (!string.Equals(existing.Token, provided, StringComparison.Ordinal))
+            {
+                _logger.LogWarning("Registro rechazado para '{ScreenId}': token incorrecto.", dto.ScreenId);
+                return Unauthorized(new { error = "Token de pantalla inválido." });
+            }
+
             if (!string.IsNullOrWhiteSpace(dto.Name))
             {
                 existing.Name = dto.Name;
@@ -152,6 +164,7 @@ public class ScreensController : ControllerBase
     /// Envía un comando a la pantalla especificada a través de SignalR.
     /// </summary>
     [HttpPost("{id}/command")]
+    [Authorize(Roles = TokenService.AdminRole)]
     public async Task<IActionResult> SendCommand(string id, [FromBody] CommandRequest request)
     {
         var result = await _commands.SendAsync(

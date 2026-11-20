@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Pcp.Server.Data;
@@ -11,6 +12,7 @@ namespace Pcp.Server.Controllers;
 /// Las operaciones se delegan al agente mediante SignalR.
 /// </summary>
 [ApiController]
+[Authorize(Roles = "Admin,Viewer")]
 [Route("api/screens/{screenId}/files")]
 public class FilesController : ControllerBase
 {
@@ -75,6 +77,7 @@ public class FilesController : ControllerBase
     /// Elimina un archivo (no carpetas).
     /// </summary>
     [HttpDelete]
+    [Authorize(Roles = TokenService.AdminRole)]
     public async Task<IActionResult> Delete(
         string screenId,
         [FromQuery] string? path,
@@ -115,6 +118,7 @@ public class FilesController : ControllerBase
     /// Sube un archivo a la carpeta indicada del agente (multipart/form-data).
     /// </summary>
     [HttpPost("upload")]
+    [Authorize(Roles = TokenService.AdminRole)]
     [RequestSizeLimit(262_144_000)]
     public async Task<IActionResult> Upload(
         string screenId,

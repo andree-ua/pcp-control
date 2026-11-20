@@ -1,3 +1,5 @@
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Pcp.Server.Data;
@@ -9,7 +11,9 @@ namespace Pcp.Server.Hubs;
 /// <summary>
 /// Hub central de SignalR para la comunicación bidireccional entre el servidor,
 /// los agentes instalados en las mini-PCs y los paneles de control web.
+/// La identidad ya no se toma del query string: el JWT identifica agentes y usuarios.
 /// </summary>
+[Authorize]
 public class ScreenHub : Hub
 {
     private readonly AppDbContext _db;
@@ -51,63 +55,56 @@ public class ScreenHub : Hub
     }
 
     /// <summary>
-    /// Se invoca al establecerse una nueva conexión.
-    /// Si provienen parámetros screenId y token, se trata de un agente; si no, se une al grupo "panel".
+    /// Se invoca al establecerse una nueva conexión. Los agentes se identifican por el
+    /// claim screen_id de su JWT; los usuarios del panel entran al grupo "panel".
     /// </summary>
     public override async Task OnConnectedAsync()
     {
-        var httpContext = Context.GetHttpContext();
-        var token = httpContext?.Request.Query["token"].ToString();
-        var screenId = httpContext?.Request.Query["screenId"].ToString();
+        var role = Context.User?.FindFirst("role")?.Value;
 
-        if (!string.IsNullOrEmpty(screenId))
+        if (string.Equals(role, TokenService.AgentRole, StringComparison.Ordinal))
         {
-            // Verificamos o recuperamos la pantalla en la base de datos
-            var screen = await _db.Screens.FirstOrDefaultAsync(s => s.Id == screenId);
+            var screenId = Context.User?.FindFirst(TokenService.ScreenIdClaim)?.Value;
+            if (string.IsNullOrWhiteSpace(screenId))
+            {
+                _logger.LogWarning("Conexión de agente rechazada: el token no incluye screen_id.");
+                Context.Abort();
+                return;
+            }
 
+            var screen = await _db.Screens.FirstOrDefaultAsync(s => s.Id == screenId);
             if (screen == null)
             {
-                // Registro automático en fase de desarrollo si la pantalla aún no estaba en BD
-                screen = new Models.Screen
-                {
-                    Id = screenId,
-                    Name = $"Pantalla {screenId}",
-                    Token = string.IsNullOrEmpty(token) ? "dev-token" : token,
-                    Status = "online",
-                    LastHeartbeat = DateTime.UtcNow,
-                    CreatedAt = DateTime.UtcNow
-                };
-                _db.Screens.Add(screen);
-            }
-            else
-            {
-                // Validación de token (en Fase 0 comprobamos coincidencia básica o token dev)
-                if (!string.IsNullOrEmpty(token) && screen.Token != token && token != "dev-token")
-                {
-                    _logger.LogWarning("Conexión rechazada: Token incorrecto para screenId '{ScreenId}'", screenId);
-                    Context.Abort();
-                    return;
-                }
-
-                screen.Status = "online";
-                screen.LastHeartbeat = DateTime.UtcNow;
+                _logger.LogWarning("Conexión de agente rechazada: pantalla '{ScreenId}' no registrada.", screenId);
+                Context.Abort();
+                return;
             }
 
+            screen.Status = "online";
+            screen.LastHeartbeat = DateTime.UtcNow;
             await _db.SaveChangesAsync();
 
-            // Asociar identificador de conexión
             _connectionManager.RegisterConnection(screenId, Context.ConnectionId);
 
-            _logger.LogInformation("Agente conectado: ScreenId='{ScreenId}', ConnectionId='{ConnectionId}'", screenId, Context.ConnectionId);
+            _logger.LogInformation(
+                "Agente conectado: ScreenId='{ScreenId}', ConnectionId='{ConnectionId}'",
+                screenId, Context.ConnectionId);
 
-            // Informar a clientes del panel administrativo
             await Clients.Group("panel").SendAsync("ScreenStatusChanged", screenId, "online");
+        }
+        else if (string.Equals(role, TokenService.AdminRole, StringComparison.Ordinal) ||
+                 string.Equals(role, TokenService.ViewerRole, StringComparison.Ordinal))
+        {
+            await Groups.AddToGroupAsync(Context.ConnectionId, "panel");
+            _logger.LogInformation(
+                "Cliente de panel web conectado: ConnectionId='{ConnectionId}', Rol='{Role}'",
+                Context.ConnectionId, role);
         }
         else
         {
-            // Conexión perteneciente al panel web o monitor
-            await Groups.AddToGroupAsync(Context.ConnectionId, "panel");
-            _logger.LogInformation("Cliente de panel web conectado: ConnectionId='{ConnectionId}'", Context.ConnectionId);
+            _logger.LogWarning("Conexión rechazada: rol no reconocido ('{Role}').", role);
+            Context.Abort();
+            return;
         }
 
         await base.OnConnectedAsync();
@@ -146,9 +143,17 @@ public class ScreenHub : Hub
     /// <summary>
     /// Recibe el latido periódico (telemetría) enviado por un agente.
     /// </summary>
+    [Authorize(Roles = TokenService.AgentRole)]
     public async Task Heartbeat(HeartbeatDto dto)
     {
         if (string.IsNullOrEmpty(dto.ScreenId)) return;
+
+        if (!IsOwnScreen(dto.ScreenId))
+        {
+            _logger.LogWarning("Heartbeat rechazado: el agente de '{Claim}' intentó reportar '{ScreenId}'.",
+                CurrentAgentScreenId, dto.ScreenId);
+            return;
+        }
 
         var screen = await _db.Screens
             .Include(s => s.Group)
@@ -203,9 +208,23 @@ public class ScreenHub : Hub
     /// <summary>
     /// Recibe la confirmación o error de ejecución de un comando por parte del agente.
     /// </summary>
+    [Authorize(Roles = TokenService.AgentRole)]
     public async Task CommandResult(CommandResultDto dto)
     {
+        if (!IsOwnScreen(dto.ScreenId))
+        {
+            _logger.LogWarning("CommandResult rechazado: el agente de '{Claim}' intentó reportar '{ScreenId}'.",
+                CurrentAgentScreenId, dto.ScreenId);
+            return;
+        }
+
         var command = await _db.Commands.FindAsync(dto.CommandId);
+        if (command != null && !string.Equals(command.ScreenId, dto.ScreenId, StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogWarning("CommandResult rechazado: el comando {CommandId} pertenece a '{Owner}'.", dto.CommandId, command.ScreenId);
+            return;
+        }
+
         if (command != null)
         {
             command.Status = dto.Status;
@@ -228,8 +247,16 @@ public class ScreenHub : Hub
     /// <summary>
     /// Recibe el resultado de una operación de archivos ejecutada por el agente.
     /// </summary>
+    [Authorize(Roles = TokenService.AgentRole)]
     public Task FileResult(FileResultDto result)
     {
+        if (!IsOwnScreen(result.ScreenId))
+        {
+            _logger.LogWarning("FileResult rechazado: el agente de '{Claim}' intentó responder por '{ScreenId}'.",
+                CurrentAgentScreenId, result.ScreenId);
+            return Task.CompletedTask;
+        }
+
         _fileRequests.Complete(result);
         return Task.CompletedTask;
     }
@@ -237,8 +264,16 @@ public class ScreenHub : Hub
     /// <summary>
     /// Recibe el estado del túnel VNC abierto por un agente (lo consume la petición REST en curso).
     /// </summary>
+    [Authorize(Roles = TokenService.AgentRole)]
     public Task VncTunnelStatus(VncTunnelStatusDto dto)
     {
+        if (!IsOwnScreen(dto.ScreenId))
+        {
+            _logger.LogWarning("VncTunnelStatus rechazado: el agente de '{Claim}' intentó reportar '{ScreenId}'.",
+                CurrentAgentScreenId, dto.ScreenId);
+            return Task.CompletedTask;
+        }
+
         _vncSessions.ReportStatus(dto);
         return Task.CompletedTask;
     }
@@ -246,9 +281,17 @@ public class ScreenHub : Hub
     /// <summary>
     /// Recibe un fotograma/miniatura periódica enviada por el agente y la retransmite en vivo al panel.
     /// </summary>
+    [Authorize(Roles = TokenService.AgentRole)]
     public async Task SendThumbnail(ThumbnailDto dto)
     {
         if (string.IsNullOrEmpty(dto.ScreenId) || string.IsNullOrEmpty(dto.ThumbnailBase64)) return;
+
+        if (!IsOwnScreen(dto.ScreenId))
+        {
+            _logger.LogWarning("Thumbnail rechazado: el agente de '{Claim}' intentó reportar '{ScreenId}'.",
+                CurrentAgentScreenId, dto.ScreenId);
+            return;
+        }
 
         // Guardar en memoria para consulta rápida inmediata del dashboard
         _latestThumbnails[dto.ScreenId] = dto.ThumbnailBase64;
@@ -257,4 +300,10 @@ public class ScreenHub : Hub
         // Reenviar a los observadores del panel web en tiempo real
         await Clients.Group("panel").SendAsync("ThumbnailReceived", dto);
     }
+
+    private string? CurrentAgentScreenId => Context.User?.FindFirst(TokenService.ScreenIdClaim)?.Value;
+
+    private bool IsOwnScreen(string? screenId)
+        => !string.IsNullOrWhiteSpace(screenId) &&
+           string.Equals(CurrentAgentScreenId, screenId, StringComparison.OrdinalIgnoreCase);
 }

@@ -8,8 +8,10 @@ import { GroupCard } from "@/components/GroupCard";
 import { ToastContainer } from "@/components/Toast";
 import { createGroup, fetchGroups } from "@/services/api";
 import { GroupInfo } from "@/types/group";
+import { useAuth } from "@/context/AuthContext";
 
 export default function GroupsPage() {
+  const { isAdmin } = useAuth();
   const {
     screens,
     loading: loadingScreens,
@@ -120,6 +122,7 @@ export default function GroupsPage() {
         )}
 
         {/* Crear grupo */}
+        {isAdmin && (
         <section className="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-5 space-y-4">
           <h3 className="text-sm font-semibold uppercase tracking-wider text-zinc-400">
             Nuevo grupo
@@ -197,6 +200,7 @@ export default function GroupsPage() {
             )}
           </div>
         </section>
+        )}
 
         {/* Listado de grupos */}
         {loadingGroups && groups.length === 0 ? (

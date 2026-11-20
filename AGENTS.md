@@ -1,7 +1,7 @@
 # AGENTS.md — PCP (Panel de Control de Pantallas)
 
 Mapa de arquitectura y reglas de negocio del proyecto. **Léelo antes de tocar código.**
-Última actualización: 2026-11-20 (Fases 0–3 completas + preparación de producción: MySQL, migraciones, agente single-file y despliegue en nube).
+Última actualización: 2026-11-20 (Fase 0–3 completas + Bloque 1 de Fase 3: JWT, roles y login del panel).
 
 ---
 
@@ -21,7 +21,7 @@ Pcp.Web (Next.js, 3000/3001)  ──REST──▶  Pcp.Server (ASP.NET Core, 500
 ```
 
 - **Servidor = fuente de verdad**: persiste pantallas y comandos en MySQL 8 (producción) o SQLite (desarrollo), mantiene el mapeo
-  `ScreenId ↔ ConnectionId` en memoria y retransmite telemetría/miniaturas al panel.
+  `ScreenId ↔ ConnectionId` en memoria y retransmite telemetría/miniaturas al panel. Autentica panel y agentes con JWT.
 - **Agente = ejecutor tonto**: no decide nada; obedece comandos, reporta heartbeat, miniaturas y resultado.
 - **Panel = observador/operador**: pinta estado y manda comandos; no habla con agentes directamente.
 
@@ -177,6 +177,23 @@ Reglas del control remoto:
 - Errores: **404** pantalla inexistente, **400** offline o sin conexión, **504** el agente no confirmó, **502** el agente no pudo abrir el VNC (el `error` trae el motivo exacto).
 - La sesión caduca a los **90 s** si el panel no abre el WebSocket; máximo absoluto **12 h**.
 - El servidor no toca el escritorio del agente: retransmite bytes entre dos WebSockets.
+
+### REST — Autenticación (`Controllers/AuthController.cs`)
+
+| Método | Ruta | Comportamiento |
+|---|---|---|
+| POST | `/api/auth/login` | Valida usuario/contraseña (PBKDF2) y deja el JWT en la cookie HttpOnly `pcp_auth`. Límite de 10 intentos/5 min por IP. |
+| POST | `/api/auth/logout` | Borra la cookie de sesión. Idempotente. |
+| GET | `/api/auth/me` | Usuario autenticado (id, username, displayName, role). |
+| POST | `/api/auth/agent-token` | Canjea `screenId + token de dispositivo` por un JWT con rol `Agent` y claim `screen_id` (30 días). |
+
+Reglas de autenticación:
+- Dos roles de panel: `Admin` (todo) y `Viewer` (solo lectura). Los agentes usan el rol `Agent`.
+- El panel no guarda el JWT en JS: viaja en la cookie HttpOnly. El middleware de Next solo usa una cookie marcadora no sensible (`pcp_session=1`).
+- Los controladores de panel usan `[Authorize(Roles = "Admin,Viewer")]`; las mutaciones exigen `Admin`. El Hub exige JWT y valida que el `screen_id` del DTO coincida con el claim.
+- `POST /api/screens/register` es anónimo, pero si la pantalla ya existe exige que el token de dispositivo coincida.
+- Durante una actualización escalonada, `Auth:AllowLegacyAgentTokens=true` acepta agentes antiguos que se conectan al Hub con `?screenId&token`. Los agentes nuevos envían JWT y mantienen esos parámetros solo para compatibilidad con servidores antiguos. Desactivar el flag cuando toda la flota esté actualizada.
+- La clave `Auth__SigningKey` es obligatoria en producción (mínimo 32 caracteres). El administrador inicial se siembra desde `Auth__AdminUsername` / `Auth__AdminPassword` solo si `Users` está vacía.
 
 ### WebSockets del túnel — `Program.cs`
 
@@ -404,8 +421,8 @@ Espejo camelCase de los DTOs: `ScreenInfo` (incluye `remoteControlAvailable`), `
 4. **Reproducción**: un solo medio a la vez por pantalla; `stop` vuelve a `idle`; `pause` es *toggle* (no pausa idempotente).
 5. **Miniaturas**: el agente las produce cada 5 s (o inmediatamente tras play/stop); el servidor solo guarda **la última por pantalla en memoria** (no hay histórico ni persistencia). El panel las pinta en Base64.
 6. **Métricas**: CPU simulada, RAM aproximada del proceso, disco real. No usar estos valores para alertas de producción.
-7. **Seguridad**: HTTP sin autenticación; CORS limitado a `Cors:AllowedOrigins` (localhost automático solo en Development); `shutdown`/`restart` requieren `AllowSystemCommands`. Sigue siendo necesario HTTPS + login antes de exponer a Internet. El auto-logon opcional del instalador guarda la contraseña en texto claro en el registro: usar un usuario kiosco dedicado y sin privilegios de administrador.
-8. **Persistencia**: MySQL 8 con migraciones EF (`Database.Migrate()`); SQLite es solo fallback de desarrollo con `EnsureCreated()`. Thumbnails y mapeo de conexiones viven solo en memoria.
+7. **Seguridad**: panel y agentes se autentican con JWT (cookie HttpOnly para el panel, `Authorization: Bearer` para el agente y `access_token` en WebSockets). Roles `Admin`/`Viewer`; las mutaciones exigen `Admin`. CORS limitado a `Cors:AllowedOrigins` y validación de `Origin` en métodos mutantes como defensa CSRF. `shutdown`/`restart` siguen requiriendo `AllowSystemCommands` en el agente. El auto-logon opcional del instalador guarda la contraseña en texto claro en el registro: usar un usuario kiosco dedicado y sin privilegios de administrador.
+8. **Persistencia**: MySQL 8 con migraciones EF (`Database.Migrate()`); SQLite es solo fallback de desarrollo con `EnsureCreated()`. Thumbnails y mapeo de conexiones viven solo en memoria. La tabla `Users` guarda usuarios del panel con hash PBKDF2 y rol. En desarrollo, al añadir tablas hay que recrear `pcp.db` (EnsureCreated no altera una BD existente).
 9. **Sin tests automatizados** en la solución.
 10. **Archivos**: el explorador navega por las unidades fijas del agente con lista negra de rutas críticas; solo borra archivos, no carpetas; no sobrescribe archivos existentes; la subida va por chunks Base64 y se confirma en un archivo temporal movido al destino. El panel muestra progreso real: XHR para el tramo navegador → servidor y `FileUploadProgress` (SignalR, identificado por `clientRequestId`) para el tramo servidor → agente. "Reproducir" no descarga el archivo: envía `play` con la ruta local del agente.
 11. **Transferencia de archivos**: el servidor actúa de puente; no almacena los archivos subidos. Si el agente se cae a mitad de una subida, el servidor cancela y el agente limpia el temporal al cancelar; si el proceso muere, puede quedar un `.pcp-upload-*.tmp`.
@@ -443,8 +460,8 @@ powershell -ExecutionPolicy Bypass -File C:\Proyectos\Pcp\scripts\publish-agent.
 ```
 
 Claves de configuración relevantes:
-- `Pcp.Server/appsettings.json` → `Database:MySqlVersion`, `ConnectionStrings:DefaultConnection` (SQLite dev), `Files:MaxUploadMb`.
-- `Pcp.Server/appsettings.Production.json` → `Database:Provider=MySql`, `Cors:AllowedOrigins`. La cadena real **nunca** se versiona: usar `ConnectionStrings__MySql` o `DATABASE_URL`/`MYSQL_URL`/`MYSQL_ADDON_URI`, más `Cors__AllowedOrigins__0..N`, `PORT` y `Files__MaxUploadMb`.
+- `Pcp.Server/appsettings.json` → `Database:MySqlVersion`, `ConnectionStrings:DefaultConnection` (SQLite dev), `Files:MaxUploadMb`, `Auth:*` (emisor, audiencia, cookie, duración de tokens, usuario admin inicial).
+- `Pcp.Server/appsettings.Production.json` → `Database:Provider=MySql`, `Cors:AllowedOrigins`, `Auth:CookieSameSite=None`. La cadena real y `Auth__SigningKey` **nunca** se versionan: usar `ConnectionStrings__MySql` o `DATABASE_URL`/`MYSQL_URL`/`MYSQL_ADDON_URI`, más `Auth__SigningKey`, `Auth__AdminPassword`, `Cors__AllowedOrigins__0..N`, `PORT` y `Files__MaxUploadMb`.
 - `Pcp.Agent/appsettings.json` (opcional) → `Agent:ScreenId`, `Agent:Name`, `Agent:Token`, `Agent:ServerUrl`, `Agent:DevMode`, `Agent:AllowSystemCommands`, `Agent:SystemCommandDelaySeconds`, `Agent:FileRoots`, `Agent:ProtectedPaths`, `Agent:MaxUploadMb`, `Agent:LogPath`, `Agent:Kiosk:TopMostOnlyWhilePlaying`, `Agent:Kiosk:IdleWindowState`, `Agent:Vnc:*`. Se puede omitir y usar `PCP_SERVER_URL`, `PCP_SCREEN_ID`, `PCP_SCREEN_NAME`, `PCP_TOKEN` o `PCP_Agent__*`.
 - `Pcp.Web/.env.local` (dev) y `Pcp.Web/.env.production` (build) → `NEXT_PUBLIC_API_URL` (y `NEXT_PUBLIC_SERVER_URL`).
 - `.env.example` en la raíz documenta todas las variables de producción.
@@ -473,6 +490,8 @@ o con `Agent:ScreenId` (appsettings/CLI).
 - Los comandos de sistema reales no tienen autenticación ni autorización por roles; requieren una capa de auth antes de producción.
 - No hay autenticación real, rate limiting ni HTTPS.
 - No hay tests automatizados. Las migraciones EF son específicas de MySQL (`InitialCreate`); SQLite de desarrollo usa `EnsureCreated` y no aplica esas migraciones.
+- Gestión de usuarios incompleta: no hay CRUD de `Users` ni cambio de contraseña desde el panel; los usuarios adicionales deben insertarse en BD con el hash PBKDF2. El token de dispositivo por defecto `dev-token` sigue aceptándose para no romper la flota y se registra una advertencia en producción; debe rotarse antes de exponer el sistema.
+- El JWT del agente dura 30 días y se renueva solo al reiniciar o al reconectar SignalR; no hay endpoint de refresh explícito.
 - `fitMode` se envía pero **no se aplica** en el agente.
 - `pause` no distingue pausar de reanudar; no hay `seek`.
 - Thumbnails sin límite de tamaño/antigüedad y sin compresión adaptativa.

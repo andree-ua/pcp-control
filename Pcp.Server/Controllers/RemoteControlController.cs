@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
@@ -13,6 +14,7 @@ namespace Pcp.Server.Controllers;
 /// El servidor solo hace de puente: no guarda imágenes ni estado entre sesiones.
 /// </summary>
 [ApiController]
+[Authorize(Roles = TokenService.AdminRole)]
 [Route("api/screens/{screenId}/remote")]
 public class RemoteControlController : ControllerBase
 {

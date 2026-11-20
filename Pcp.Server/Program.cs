@@ -1,9 +1,17 @@
 using System.Net.WebSockets;
+using System.Text;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.OpenApi.Models;
 using Pcp.Server.Data;
 using Pcp.Server.Hubs;
+using Pcp.Server.Models;
 using Pcp.Server.Services;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -56,12 +64,116 @@ builder.Services.AddSingleton<IFileRequestManager, FileRequestManager>();
 // Sesiones de control remoto (túnel VNC panel ↔ agente)
 builder.Services.AddSingleton<IVncSessionManager, VncSessionManager>();
 builder.Services.AddScoped<ScreenCommandService>();
+builder.Services.AddSingleton<TokenService>();
 builder.Services.AddSignalR(options =>
 {
     // Las listas de archivos y los mensajes de control pueden superar el límite por defecto (32 KB).
     options.MaximumReceiveMessageSize = 10 * 1024 * 1024;
 });
 builder.Services.AddControllers();
+
+// ═══ 2b. Autenticación y autorización (Fase 3) ══════════════════════════════
+// El panel usa una cookie HttpOnly que contiene el JWT; los agentes envían el
+// token en la cabecera Authorization y, para WebSockets, en access_token.
+var authIssuer = TokenService.ResolveIssuer(builder.Configuration);
+var authAudience = TokenService.ResolveAudience(builder.Configuration);
+var authSigningKey = TokenService.ResolveSigningKey(builder.Configuration, builder.Environment.IsProduction());
+var authCookieName = builder.Configuration["Auth:CookieName"] ?? "pcp_auth";
+
+builder.Services
+    .AddAuthentication(options =>
+    {
+        // Selector dinámico: JWT para el panel/agentes nuevos y compatibilidad temporal
+        // con agentes antiguos que aún usan ?screenId&token en el Hub.
+        options.DefaultScheme = "PcpSmart";
+        options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+    })
+    .AddPolicyScheme("PcpSmart", "JWT o agente legacy", options =>
+    {
+        options.ForwardDefaultSelector = context =>
+        {
+            var isHub = context.Request.Path.StartsWithSegments("/hubs/screen");
+            var hasLegacyQuery = context.Request.Query.ContainsKey("screenId") &&
+                                 context.Request.Query.ContainsKey("token");
+            var hasAccessToken = context.Request.Query.ContainsKey("access_token");
+            var hasAuthorizationHeader = !string.IsNullOrEmpty(context.Request.Headers.Authorization);
+            var hasAuthCookie = context.Request.Cookies.ContainsKey(authCookieName);
+
+            if (isHub && hasLegacyQuery && !hasAccessToken && !hasAuthorizationHeader && !hasAuthCookie)
+            {
+                return LegacyAgentAuthenticationHandler.SchemeName;
+            }
+
+            return JwtBearerDefaults.AuthenticationScheme;
+        };
+    })
+    .AddScheme<AuthenticationSchemeOptions, LegacyAgentAuthenticationHandler>(
+        LegacyAgentAuthenticationHandler.SchemeName, _ => { })
+    .AddJwtBearer(options =>
+    {
+        options.MapInboundClaims = false;
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidIssuer = authIssuer,
+            ValidateAudience = true,
+            ValidAudience = authAudience,
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(authSigningKey)),
+            ValidateLifetime = true,
+            ClockSkew = TimeSpan.FromSeconds(30),
+            NameClaimType = "name",
+            RoleClaimType = "role"
+        };
+
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                // WebSockets no pueden enviar cabeceras arbitrarias: SignalR y noVNC
+                // adjuntan el token en la query.
+                var accessToken = context.Request.Query["access_token"];
+                var path = context.HttpContext.Request.Path;
+
+                if (!string.IsNullOrEmpty(accessToken) &&
+                    (path.StartsWithSegments("/hubs/screen") || path.StartsWithSegments("/ws/vnc")))
+                {
+                    context.Token = accessToken;
+                    return Task.CompletedTask;
+                }
+
+                // Resto de peticiones del panel: el JWT viene en la cookie HttpOnly.
+                if (string.IsNullOrEmpty(context.Token))
+                {
+                    var cookieToken = context.Request.Cookies[authCookieName];
+                    if (!string.IsNullOrEmpty(cookieToken))
+                    {
+                        context.Token = cookieToken;
+                    }
+                }
+
+                return Task.CompletedTask;
+            }
+        };
+    });
+
+builder.Services.AddAuthorization();
+
+// Límite de intentos de login por IP: frena la fuerza bruta sin afectar al resto.
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy("login", httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 10,
+                Window = TimeSpan.FromMinutes(5),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+});
 
 // Límite de subida de archivos (multipart/form-data)
 var maxUploadMb = builder.Configuration.GetValue<long?>("Files:MaxUploadMb") ?? 200;
@@ -72,7 +184,33 @@ builder.Services.Configure<FormOptions>(options =>
 
 // Documentación de endpoints con Swagger
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
+builder.Services.AddSwaggerGen(options =>
+{
+    options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    {
+        Name = "Authorization",
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT",
+        In = ParameterLocation.Header,
+        Description = "JWT del panel o del agente. Para el panel también se acepta la cookie HttpOnly 'pcp_auth'."
+    });
+
+    options.AddSecurityRequirement(new OpenApiSecurityRequirement
+    {
+        {
+            new OpenApiSecurityScheme
+            {
+                Reference = new OpenApiReference
+                {
+                    Type = ReferenceType.SecurityScheme,
+                    Id = "Bearer"
+                }
+            },
+            Array.Empty<string>()
+        }
+    });
+});
 
 // Tarea en segundo plano para auditoría de timeout de pantallas (offline detection)
 builder.Services.AddHostedService<OfflineCheckerService>();
@@ -138,6 +276,7 @@ if (isDevelopment == false && configuredOrigins.Length == 0)
 // MySQL en la nube puede tardar en aceptar conexiones durante el arranque:
 // se reintenta la migración antes de dejar el servidor inoperativo.
 await InitializeDatabaseAsync(app, useMySql);
+await SeedAdminUserAsync(app);
 
 // ═══ 5. Pipeline HTTP ═══════════════════════════════════════════════════════
 if (app.Environment.IsDevelopment())
@@ -148,6 +287,31 @@ if (app.Environment.IsDevelopment())
 
 app.UseForwardedHeaders();
 app.UseCors(corsPolicyName);
+
+// Defensa CSRF complementaria a SameSite: si el navegador envía Origin en una
+// petición mutante, debe ser uno de los orígenes permitidos. Los agentes y las
+// herramientas sin navegador no envían Origin y usan Authorization: Bearer.
+app.Use(async (context, next) =>
+{
+    if (!HttpMethods.IsGet(context.Request.Method) &&
+        !HttpMethods.IsHead(context.Request.Method) &&
+        !HttpMethods.IsOptions(context.Request.Method))
+    {
+        var origin = context.Request.Headers.Origin.ToString();
+        if (!string.IsNullOrEmpty(origin) && !IsAllowedOrigin(origin, configuredOrigins, isDevelopment))
+        {
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            await context.Response.WriteAsJsonAsync(new { error = "Origen no permitido." });
+            return;
+        }
+    }
+
+    await next();
+});
+
+app.UseRateLimiter();
+app.UseAuthentication();
+app.UseAuthorization();
 
 // ═══ 6. Túnel de escritorio remoto (VNC sobre WebSocket) ════════════════════
 // El panel y el agente se conectan aquí; el servidor solo bombea bytes (RFB).
@@ -167,6 +331,18 @@ app.UseWebSockets(new WebSocketOptions
 // Extremo del panel web (noVNC)
 app.MapGet("/ws/vnc/{sessionId}", async (HttpContext ctx, string sessionId, IVncSessionManager sessions) =>
 {
+    if (ctx.User.Identity?.IsAuthenticated != true)
+    {
+        ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        return;
+    }
+
+    if (!ctx.User.IsInRole(TokenService.AdminRole))
+    {
+        ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+        return;
+    }
+
     if (!ctx.WebSockets.IsWebSocketRequest)
     {
         ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
@@ -318,4 +494,55 @@ static async Task InitializeDatabaseAsync(WebApplication app, bool useMySql)
             await Task.Delay(TimeSpan.FromSeconds(5));
         }
     }
+}
+
+/// <summary>
+/// Crea el primer usuario administrador si la tabla está vacía.
+/// En producción la contraseña es obligatoria (Auth__AdminPassword); en desarrollo
+/// se usa "admin123" para no bloquear el arranque local.
+/// </summary>
+static async Task SeedAdminUserAsync(WebApplication app)
+{
+    using var scope = app.Services.CreateScope();
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+    if (await db.Users.AnyAsync())
+    {
+        return;
+    }
+
+    var username = (app.Configuration["Auth:AdminUsername"] ?? "admin").Trim().ToLowerInvariant();
+    var password = app.Configuration["Auth:AdminPassword"];
+
+    if (string.IsNullOrWhiteSpace(password))
+    {
+        if (!app.Environment.IsDevelopment())
+        {
+            throw new InvalidOperationException(
+                "No existe ningún usuario y falta Auth__AdminPassword. Configure " +
+                "Auth__AdminUsername y Auth__AdminPassword para sembrar el administrador inicial.");
+        }
+
+        password = "admin123";
+        app.Logger.LogWarning(
+            "Usuario administrador de desarrollo creado: '{Username}' / 'admin123'. " +
+            "Cambie la contraseña antes de exponer el servidor.", username);
+    }
+    else
+    {
+        app.Logger.LogInformation("Usuario administrador inicial creado: '{Username}'.", username);
+    }
+
+    db.Users.Add(new User
+    {
+        Id = Guid.NewGuid(),
+        Username = username,
+        DisplayName = "Administrador",
+        PasswordHash = PasswordHasher.Hash(password),
+        Role = TokenService.AdminRole,
+        IsActive = true,
+        CreatedAt = DateTime.UtcNow
+    });
+
+    await db.SaveChangesAsync();
 }

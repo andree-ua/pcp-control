@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Pcp.Server.Data;
@@ -11,6 +12,7 @@ namespace Pcp.Server.Controllers;
 /// Gestión de grupos de pantallas y envío de comandos masivos.
 /// </summary>
 [ApiController]
+[Authorize(Roles = "Admin,Viewer")]
 [Route("api/groups")]
 public class GroupsController : ControllerBase
 {
@@ -43,6 +45,7 @@ public class GroupsController : ControllerBase
 
     /// <summary>POST /api/groups — crea un grupo y asigna las pantallas indicadas.</summary>
     [HttpPost]
+    [Authorize(Roles = TokenService.AdminRole)]
     public async Task<IActionResult> Create(
         [FromBody] GroupUpsertDto dto,
         CancellationToken cancellationToken)
@@ -78,6 +81,7 @@ public class GroupsController : ControllerBase
 
     /// <summary>PUT /api/groups/{id} — renombra el grupo y reemplaza su membresía.</summary>
     [HttpPut("{id:guid}")]
+    [Authorize(Roles = TokenService.AdminRole)]
     public async Task<IActionResult> Update(
         Guid id,
         [FromBody] GroupUpsertDto dto,
@@ -126,6 +130,7 @@ public class GroupsController : ControllerBase
 
     /// <summary>DELETE /api/groups/{id} — elimina el grupo y desasigna sus pantallas.</summary>
     [HttpDelete("{id:guid}")]
+    [Authorize(Roles = TokenService.AdminRole)]
     public async Task<IActionResult> Delete(Guid id, CancellationToken cancellationToken)
     {
         var group = await _db.ScreenGroups
@@ -155,6 +160,7 @@ public class GroupsController : ControllerBase
     /// Las pantallas offline se omiten y se informan en el resumen.
     /// </summary>
     [HttpPost("{id:guid}/command")]
+    [Authorize(Roles = TokenService.AdminRole)]
     public async Task<IActionResult> SendCommand(
         Guid id,
         [FromBody] CommandRequest request,

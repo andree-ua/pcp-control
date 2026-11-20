@@ -10,6 +10,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Autenticación JWT para el panel y los agentes (Fase 3). -->
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.8" />
     <!-- SQLite se conserva como proveedor de desarrollo local (fallback). -->
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.34" />
     <!-- Proveedor de producción: MySQL 8.x / MariaDB -->

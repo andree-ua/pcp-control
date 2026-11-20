@@ -22,6 +22,9 @@ public class AppDbContext : DbContext
     /// <summary>Historial de comandos y órdenes emitidas a las pantallas.</summary>
     public DbSet<Command> Commands => Set<Command>();
 
+    /// <summary>Usuarios del panel con sus roles (Fase 3).</summary>
+    public DbSet<User> Users => Set<User>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
@@ -57,6 +60,17 @@ public class AppDbContext : DbContext
             entity.Property(c => c.Type).HasMaxLength(50).IsRequired();
             entity.Property(c => c.Status).HasMaxLength(20).IsRequired();
             entity.Property(c => c.ResultDetail).HasMaxLength(1000);
+        });
+
+        // Configuración de la entidad User (Fase 3)
+        modelBuilder.Entity<User>(entity =>
+        {
+            entity.HasKey(u => u.Id);
+            entity.Property(u => u.Username).HasMaxLength(64).IsRequired();
+            entity.Property(u => u.DisplayName).HasMaxLength(100).IsRequired();
+            entity.Property(u => u.PasswordHash).HasMaxLength(256).IsRequired();
+            entity.Property(u => u.Role).HasMaxLength(20).IsRequired();
+            entity.HasIndex(u => u.Username).IsUnique();
         });
     }
 }

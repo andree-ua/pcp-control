@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { ScreenInfo } from "@/types/screen";
 import { sendScreenCommand } from "@/services/api";
+import { useAuth } from "@/context/AuthContext";
 import { FileExplorerModal } from "@/components/FileExplorerModal";
 import { RemoteDesktopModal } from "@/components/RemoteDesktopModal";
 import { SystemActionsMenu } from "@/components/SystemActionsMenu";
@@ -31,6 +32,7 @@ interface ScreenCardProps {
 }
 
 export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
+  const { isAdmin } = useAuth();
   const [loadingAction, setLoadingAction] = useState<string | null>(null);
   const [showOptions, setShowOptions] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
@@ -42,6 +44,11 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
   const isPlaying = isOnline && screen.currentMedia && screen.currentMedia !== "idle";
 
   const handleCommand = async (type: string, payload?: Record<string, unknown>) => {
+    if (!isAdmin) {
+      onError("Permisos insuficientes", "Tu cuenta es Viewer: no puede enviar comandos.");
+      return;
+    }
+
     if (!isOnline) {
       onError("Pantalla Offline", `La pantalla [${screen.id}] está desconectada.`);
       return;
@@ -305,9 +312,9 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
             {/* Play */}
             <button
               onClick={handlePlay}
-              disabled={!isOnline || loadingAction === "play"}
+              disabled={!isOnline || !isAdmin || loadingAction === "play"}
               className="flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl font-medium text-xs bg-emerald-600 hover:bg-emerald-500 text-white transition-all active:scale-95 disabled:opacity-40 disabled:pointer-events-none shadow-sm shadow-emerald-950"
-              title="Reproducir medio con LibVLC"
+              title={isAdmin ? "Reproducir medio con LibVLC" : "Solo administradores"}
             >
               <Play className={`w-3.5 h-3.5 fill-current ${loadingAction === "play" ? "animate-spin" : ""}`} />
               <span>Play</span>
@@ -316,9 +323,9 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
             {/* Pause */}
             <button
               onClick={handlePause}
-              disabled={!isOnline || loadingAction === "pause"}
+              disabled={!isOnline || !isAdmin || loadingAction === "pause"}
               className="flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl font-medium text-xs bg-amber-600/90 hover:bg-amber-500 text-white transition-all active:scale-95 disabled:opacity-40 disabled:pointer-events-none shadow-sm shadow-amber-950"
-              title="Pausar o reanudar"
+              title={isAdmin ? "Pausar o reanudar" : "Solo administradores"}
             >
               <Pause className={`w-3.5 h-3.5 fill-current ${loadingAction === "pause" ? "animate-spin" : ""}`} />
               <span>Pausar</span>
@@ -327,9 +334,9 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
             {/* Stop */}
             <button
               onClick={handleStop}
-              disabled={!isOnline || loadingAction === "stop"}
+              disabled={!isOnline || !isAdmin || loadingAction === "stop"}
               className="flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl font-medium text-xs bg-zinc-800 hover:bg-rose-600 text-zinc-200 hover:text-white transition-all active:scale-95 disabled:opacity-40 disabled:pointer-events-none border border-zinc-700/80 shadow-sm"
-              title="Detener reproducción"
+              title={isAdmin ? "Detener reproducción" : "Solo administradores"}
             >
               <Square className={`w-3.5 h-3.5 fill-current ${loadingAction === "stop" ? "animate-spin" : ""}`} />
               <span>Stop</span>
@@ -340,9 +347,9 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
           <div className="mt-2 grid grid-cols-2 gap-2">
             <button
               onClick={() => setShowFiles(true)}
-              disabled={!isOnline}
+              disabled={!isOnline || !isAdmin}
               className="w-full flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl font-medium text-xs bg-indigo-600/90 hover:bg-indigo-500 text-white transition-all active:scale-95 disabled:opacity-40 disabled:pointer-events-none border border-indigo-500/50 shadow-sm shadow-indigo-950"
-              title="Abrir explorador de archivos"
+              title={isAdmin ? "Abrir explorador de archivos" : "Solo administradores"}
             >
               <FolderOpen className="w-3.5 h-3.5" />
               <span>Archivos</span>
@@ -359,10 +366,12 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
           {/* Control total del escritorio (VNC) */}
           <button
             onClick={() => setShowRemote(true)}
-            disabled={!isOnline}
+            disabled={!isOnline || !isAdmin}
             className="mt-2 w-full flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl font-semibold text-xs bg-gradient-to-r from-sky-600 via-indigo-600 to-violet-600 hover:from-sky-500 hover:via-indigo-500 hover:to-violet-500 text-white transition-all active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none border border-indigo-400/40 shadow-lg shadow-indigo-950/60"
             title={
-              screen.remoteControlAvailable === false
+              !isAdmin
+                ? "Solo administradores"
+                : screen.remoteControlAvailable === false
                 ? "Abrir escritorio remoto (el agente aún no reporta TightVNC)"
                 : "Abrir escritorio remoto (ratón y teclado)"
             }
@@ -403,8 +412,8 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
                     </label>
                     <button
                       onClick={handleVolumeSubmit}
-                      disabled={!isOnline}
-                      className="text-[10px] text-indigo-400 hover:text-indigo-300 font-medium"
+                      disabled={!isOnline || !isAdmin}
+                      className="text-[10px] text-indigo-400 hover:text-indigo-300 font-medium disabled:opacity-40"
                     >
                       Aplicar volumen
                     </button>

@@ -147,6 +147,7 @@ var host = Host.CreateDefaultBuilder(args)
         services.AddSingleton<SystemCommandService>();
         services.AddSingleton<VncServerManager>();
         services.AddSingleton<VncRemoteControlService>();
+        services.AddSingleton<AgentTokenProvider>();
         services.AddHostedService<AgentService>();
     })
     .Build();

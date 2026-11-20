@@ -12,6 +12,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { sendScreenCommand } from "@/services/api";
+import { useAuth } from "@/context/AuthContext";
 
 interface SystemActionsMenuProps {
   screenId: string;
@@ -60,6 +61,7 @@ export function SystemActionsMenu({
   onSuccess,
   onError,
 }: SystemActionsMenuProps) {
+  const { isAdmin } = useAuth();
   const [open, setOpen] = useState(false);
   const [busyType, setBusyType] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -103,9 +105,9 @@ export function SystemActionsMenu({
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
-        disabled={!isOnline || busyType !== null}
+        disabled={!isOnline || !isAdmin || busyType !== null}
         className="w-full flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl font-medium text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-200 transition-all active:scale-95 disabled:opacity-40 disabled:pointer-events-none border border-zinc-700/80"
-        title="Acciones de sistema"
+        title={isAdmin ? "Acciones de sistema" : "Solo administradores"}
       >
         {busyType ? (
           <Loader2 className="w-3.5 h-3.5 animate-spin" />

@@ -1,5 +1,5 @@
 # PCP — Panel de Control de Pantallas
-## Fase 0 (Backend & Agente) + Fase 1 (Panel Web Next.js) + Fase 2 (Reproductor LibVLC & Miniaturas) + Fase 3 (Control Total VNC)
+## Fase 0 (Backend & Agente) + Fase 1 (Panel Web Next.js) + Fase 2 (Reproductor LibVLC & Miniaturas) + Fase 3 (Control Total VNC, JWT y roles)
 
 Sistema de administración y control remoto para mini-PCs Windows (sticks) conectadas a televisores, administradas centralizadamente mediante ASP.NET Core, SignalR, Entity Framework Core (MySQL 8 en producción, SQLite en desarrollo), reproductor multimedia kiosco acelerado por hardware (LibVLC) y panel de control en Next.js con streaming de miniaturas en vivo.
 
@@ -60,6 +60,10 @@ dotnet run
 ```
 *Servidor operativo en:* `http://localhost:5000`  
 *Swagger interactivo:* `http://localhost:5000/swagger`
+
+En desarrollo se siembra el administrador `admin` / `admin123` si la tabla `Users`
+está vacía (configurable con `Auth__AdminUsername` / `Auth__AdminPassword`).
+En producción esas variables son obligatorias para el primer arranque.
 
 ---
 
@@ -209,7 +213,10 @@ El archivo, si está, se lee desde la misma carpeta que `Pcp.Agent.exe`.
 3. Haz clic sobre el lienzo para capturar teclado y ratón.
 4. Barra superior: **Solo ver / Control**, **Ctrl+Alt+Del**, pantalla completa y cerrar.
 
-> Sin TLS ni autenticación de usuarios en esta fase: úsalo solo en red local de confianza.
+> El panel exige login desde la Fase 3. El JWT viaja en una cookie HttpOnly y el
+> panel solo guarda una marca de sesión para el middleware de Next.js. Roles:
+> `Admin` (control total) y `Viewer` (solo lectura). La API rechaza comandos,
+> archivos, wake y control remoto si el rol no es `Admin`.
 
 ---
 
@@ -226,6 +233,9 @@ $env:DATABASE_URL="mysql://usuario:password@host:3306/pcp?ssl-mode=REQUIRED"
 # o bien:
 $env:ConnectionStrings__MySql="Server=host;Port=3306;Database=pcp;User ID=usuario;Password=password;SslMode=Required;"
 $env:Cors__AllowedOrigins__0="https://panel.example.com"
+$env:Auth__SigningKey="clave-aleatoria-de-al-menos-32-caracteres"
+$env:Auth__AdminPassword="contraseña-inicial-fuerte"
+$env:Auth__CookieSameSite="None"   # panel y API en dominios distintos, siempre con HTTPS
 $env:PORT="8080"
 cd C:\Proyectos\Pcp\Pcp.Server
 dotnet run

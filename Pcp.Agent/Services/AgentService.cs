@@ -23,6 +23,7 @@ public class AgentService : BackgroundService
     private readonly FileService _fileService;
     private readonly SystemCommandService _systemCommands;
     private readonly VncRemoteControlService _remoteControl;
+    private readonly AgentTokenProvider _tokens;
 
     private HubConnection? _hubConnection;
 
@@ -31,13 +32,15 @@ public class AgentService : BackgroundService
         ILogger<AgentService> logger,
         FileService fileService,
         SystemCommandService systemCommands,
-        VncRemoteControlService remoteControl)
+        VncRemoteControlService remoteControl,
+        AgentTokenProvider tokens)
     {
         _config = config;
         _logger = logger;
         _fileService = fileService;
         _systemCommands = systemCommands;
         _remoteControl = remoteControl;
+        _tokens = tokens;
         _playerManager = new VlcPlayerManager(config);
 
         // El túnel VNC suspende el kiosco mientras el operador usa el escritorio.
@@ -61,11 +64,27 @@ public class AgentService : BackgroundService
         // 1. Intentar pre-registro REST en el servidor
         await TryRegisterRestAsync(serverUrl, screenId, screenName, token, stoppingToken);
 
-        // 2. Configuración de conexión SignalR con política de reconexión automática
-        var hubUrl = $"{serverUrl.TrimEnd('/')}/hubs/screen?token={Uri.EscapeDataString(token)}&screenId={Uri.EscapeDataString(screenId)}";
+        // 2. Configuración de conexión SignalR con política de reconexión automática.
+        // La identidad viaja en el JWT obtenido tras el registro; SignalR lo adjunta
+        // en cada (re)conexión, incluida la query access_token del WebSocket.
+        var initialToken = await _tokens.GetTokenAsync(stoppingToken);
+        if (string.IsNullOrEmpty(initialToken))
+        {
+            AgentLog.Warn("Aún no hay token JWT de agente. Se reintentará al conectar.");
+        }
+
+        // Se conservan screenId/token en la query para que este agente también pueda
+        // conectarse a un servidor de Fase 1/2 durante una actualización escalonada.
+        // El servidor nuevo autentica por JWT (access_token) e ignora estos parámetros.
+        var hubUrl = $"{serverUrl.TrimEnd('/')}/hubs/screen" +
+                     $"?screenId={Uri.EscapeDataString(screenId)}" +
+                     $"&token={Uri.EscapeDataString(token)}";
 
         _hubConnection = new HubConnectionBuilder()
-            .WithUrl(hubUrl)
+            .WithUrl(hubUrl, options =>
+            {
+                options.AccessTokenProvider = () => _tokens.GetTokenAsync();
+            })
             .WithAutomaticReconnect(new[]
             {
                 TimeSpan.Zero,
@@ -80,6 +99,8 @@ public class AgentService : BackgroundService
         _hubConnection.Reconnecting += error =>
         {
             AgentLog.Warn($"[ALERTA] Conexión perdida con el servidor. Reconectando... ({error?.Message})");
+            // Fuerza una renovación por si el servidor rotó la clave de firma.
+            _tokens.Invalidate();
             return Task.CompletedTask;
         };
 
@@ -92,6 +113,7 @@ public class AgentService : BackgroundService
         _hubConnection.Closed += error =>
         {
             AgentLog.Error($"[ERROR] Conexión cerrada. {error?.Message}");
+            _tokens.Invalidate();
             return Task.CompletedTask;
         };
 
@@ -219,6 +241,14 @@ public class AgentService : BackgroundService
                     _logger.LogInformation("Registro REST confirmado por el servidor.");
                     return;
                 }
+
+                if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                {
+                    AgentLog.Error(
+                        "El servidor rechazó el registro: el token de la pantalla no coincide. " +
+                        "Revise Agent:Token / PCP_TOKEN.");
+                    return;
+                }
             }
             catch
             {
@@ -254,6 +284,12 @@ public class AgentService : BackgroundService
             }
             catch (Exception ex)
             {
+                if (ex is HttpRequestException { StatusCode: System.Net.HttpStatusCode.Unauthorized })
+                {
+                    // El servidor rotó la clave o revocó el token: se renueva en el próximo intento.
+                    _tokens.Invalidate();
+                }
+
                 AgentLog.Warn($"Servidor aún no disponible ({ex.Message}). Reintentando en 3s...");
 
                 try

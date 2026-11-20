@@ -1,8 +1,9 @@
 "use client";
 
-import { RefreshCw, Monitor, Radio, Users } from "lucide-react";
+import { RefreshCw, Monitor, Radio, Users, LogOut, ShieldCheck, Eye } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useAuth } from "@/context/AuthContext";
 
 interface HeaderProps {
   connectionStatus: "connected" | "reconnecting" | "disconnected";
@@ -12,6 +13,7 @@ interface HeaderProps {
 
 export function Header({ connectionStatus, onRefresh, isLoading }: HeaderProps) {
   const pathname = usePathname();
+  const { user, isAdmin, signOut } = useAuth();
 
   return (
     <header className="border-b border-zinc-800 bg-zinc-900/60 backdrop-blur-md sticky top-0 z-40">
@@ -59,6 +61,27 @@ export function Header({ connectionStatus, onRefresh, isLoading }: HeaderProps) 
 
         {/* Status & Actions */}
         <div className="flex items-center gap-4">
+          {/* Usuario y rol */}
+          <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-full bg-zinc-950/50 border border-zinc-800/80">
+            {isAdmin ? (
+              <ShieldCheck className="w-3.5 h-3.5 text-indigo-400" />
+            ) : (
+              <Eye className="w-3.5 h-3.5 text-zinc-400" />
+            )}
+            <span className="text-xs text-zinc-200 max-w-[120px] truncate">
+              {user?.displayName || user?.username}
+            </span>
+            <span
+              className={`text-[10px] px-1.5 py-0.5 rounded font-semibold ${
+                isAdmin
+                  ? "bg-indigo-500/15 text-indigo-300"
+                  : "bg-zinc-700/50 text-zinc-300"
+              }`}
+            >
+              {isAdmin ? "ADMIN" : "VIEWER"}
+            </span>
+          </div>
+
           {/* SignalR Live Badge */}
           <div
             className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium border backdrop-blur-sm transition-colors ${
@@ -92,6 +115,16 @@ export function Header({ connectionStatus, onRefresh, isLoading }: HeaderProps) 
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? "animate-spin" : ""}`} />
             <span className="hidden sm:inline">Refrescar</span>
+          </button>
+
+          {/* Logout */}
+          <button
+            onClick={() => void signOut()}
+            className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-rose-600/80 text-zinc-200 hover:text-white text-xs font-medium border border-zinc-700/80 transition-all active:scale-95"
+            title="Cerrar sesión"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+            <span className="hidden lg:inline">Salir</span>
           </button>
         </div>
       </div>

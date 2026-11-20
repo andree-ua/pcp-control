@@ -17,6 +17,7 @@ import {
 import { GroupInfo } from "@/types/group";
 import { ScreenInfo } from "@/types/screen";
 import { deleteGroup, sendGroupCommand, updateGroup } from "@/services/api";
+import { useAuth } from "@/context/AuthContext";
 
 interface GroupCardProps {
   group: GroupInfo;
@@ -27,6 +28,7 @@ interface GroupCardProps {
 }
 
 export function GroupCard({ group, screens, onChanged, onSuccess, onError }: GroupCardProps) {
+  const { isAdmin } = useAuth();
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(group.name);
   const [selectedIds, setSelectedIds] = useState<string[]>(group.screenIds);
@@ -190,7 +192,13 @@ export function GroupCard({ group, screens, onChanged, onSuccess, onError }: Gro
         </div>
       </div>
 
-      {editing ? (
+      {!isAdmin ? (
+        <div className="p-5">
+          <p className="text-xs text-zinc-500">
+            Modo solo lectura. Un administrador puede editar el grupo y enviar comandos masivos.
+          </p>
+        </div>
+      ) : editing ? (
         <div className="p-5 space-y-3">
           <p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold">
             Pantallas del grupo
