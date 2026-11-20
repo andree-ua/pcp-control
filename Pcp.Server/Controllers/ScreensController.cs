@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.EntityFrameworkCore;
 using Pcp.Server.Data;
 using Pcp.Server.Hubs;
@@ -19,15 +20,18 @@ public class ScreensController : ControllerBase
 {
     private readonly AppDbContext _db;
     private readonly ScreenCommandService _commands;
+    private readonly WakeOnLanService _wake;
     private readonly ILogger<ScreensController> _logger;
 
     public ScreensController(
         AppDbContext db,
         ScreenCommandService commands,
+        WakeOnLanService wake,
         ILogger<ScreensController> logger)
     {
         _db = db;
         _commands = commands;
+        _wake = wake;
         _logger = logger;
     }
 
@@ -53,7 +57,12 @@ public class ScreensController : ControllerBase
                 Volume = s.Volume,
                 CpuPercent = s.CpuPercent,
                 RamPercent = s.RamPercent,
-                FreeDiskMb = s.FreeDiskMb
+                FreeDiskMb = s.FreeDiskMb,
+                MacAddress = s.MacAddress,
+                LocalIp = s.LocalIp,
+                LastConnectionAt = s.LastConnectionAt,
+                WolEnabled = s.WolEnabled,
+                IsWired = s.IsWired
             })
             .ToListAsync();
 
@@ -97,6 +106,11 @@ public class ScreensController : ControllerBase
             CpuPercent = s.CpuPercent,
             RamPercent = s.RamPercent,
             FreeDiskMb = s.FreeDiskMb,
+            MacAddress = s.MacAddress,
+            LocalIp = s.LocalIp,
+            LastConnectionAt = s.LastConnectionAt,
+            WolEnabled = s.WolEnabled,
+            IsWired = s.IsWired,
             ThumbnailBase64 = ScreenHub.GetLatestThumbnail(s.Id),
             RemoteControlAvailable = ScreenHub.GetRemoteControlAvailable(s.Id)
         });
@@ -118,6 +132,11 @@ public class ScreensController : ControllerBase
         var existing = await _db.Screens.FindAsync(dto.ScreenId);
         bool isNew = false;
 
+        // Datos de red para Wake-on-LAN. Los agentes antiguos no los envían.
+        var macAddress = NetworkData.NormalizeMac(dto.MacAddress);
+        var (localIp, subnetMask, networkCidr) = NetworkData.NormalizeNetwork(
+            dto.LocalIp, dto.SubnetMask, dto.NetworkCidr);
+
         if (existing == null)
         {
             existing = new Screen
@@ -126,6 +145,12 @@ public class ScreensController : ControllerBase
                 Name = string.IsNullOrWhiteSpace(dto.Name) ? dto.ScreenId : dto.Name,
                 Token = string.IsNullOrWhiteSpace(dto.Token) ? "dev-token" : dto.Token,
                 Status = "offline",
+                MacAddress = macAddress,
+                LocalIp = localIp,
+                SubnetMask = subnetMask,
+                NetworkCidr = networkCidr,
+                IsWired = dto.IsWired,
+                LastConnectionAt = DateTime.UtcNow,
                 CreatedAt = DateTime.UtcNow
             };
             _db.Screens.Add(existing);
@@ -146,6 +171,27 @@ public class ScreensController : ControllerBase
             {
                 existing.Name = dto.Name;
             }
+
+            // Nunca se borra lo ya conocido: si un agente antiguo no reporta red,
+            // se conservan la MAC y la IP del último agente que sí lo hizo.
+            if (macAddress != null)
+            {
+                existing.MacAddress = macAddress;
+            }
+
+            if (localIp != null)
+            {
+                existing.LocalIp = localIp;
+                existing.SubnetMask = subnetMask;
+                existing.NetworkCidr = networkCidr;
+            }
+
+            if (dto.IsWired.HasValue)
+            {
+                existing.IsWired = dto.IsWired.Value;
+            }
+
+            existing.LastConnectionAt = DateTime.UtcNow;
         }
 
         await _db.SaveChangesAsync();
@@ -190,6 +236,45 @@ public class ScreensController : ControllerBase
             screenId = id,
             type = request.Type
         });
+    }
+
+    /// <summary>
+    /// POST /api/screens/{id}/wake
+    /// Enciende una pantalla apagada enviando un Magic Packet (Wake-on-LAN).
+    /// El paquete lo emite otro agente online de la misma red (relay).
+    /// </summary>
+    [HttpPost("{id}/wake")]
+    [Authorize(Roles = TokenService.AdminRole)]
+    public async Task<IActionResult> Wake(
+        string id,
+        [FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow)] WakeRequestDto? request,
+        CancellationToken cancellationToken)
+    {
+        var result = await _wake.WakeAsync(id, request?.RelayScreenId, cancellationToken);
+
+        if (!result.Success)
+        {
+            if (result.ErrorCode == "cooldown")
+            {
+                Response.Headers.RetryAfter = result.RetryAfterSeconds.ToString();
+            }
+
+            return result.ErrorCode switch
+            {
+                "not-found" => NotFound(new { error = result.Error }),
+                "already-online" => Conflict(new { error = result.Error }),
+                "no-relay" => StatusCode(
+                    StatusCodes.Status503ServiceUnavailable, new { error = result.Error }),
+                "send-failed" => StatusCode(
+                    StatusCodes.Status500InternalServerError, new { error = result.Error }),
+                "cooldown" => StatusCode(
+                    StatusCodes.Status429TooManyRequests,
+                    new { error = result.Error, retryAfterSeconds = result.RetryAfterSeconds }),
+                _ => BadRequest(new { error = result.Error })
+            };
+        }
+
+        return Ok(result.Response);
     }
 }
 

@@ -148,6 +148,8 @@ var host = Host.CreateDefaultBuilder(args)
         services.AddSingleton<VncServerManager>();
         services.AddSingleton<VncRemoteControlService>();
         services.AddSingleton<AgentTokenProvider>();
+        services.AddSingleton<NetworkInfoProvider>();
+        services.AddSingleton<WakeOnLanSender>();
         services.AddHostedService<AgentService>();
     })
     .Build();

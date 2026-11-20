@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ScreenInfo } from "@/types/screen";
-import { sendScreenCommand } from "@/services/api";
+import { sendScreenCommand, wakeScreen } from "@/services/api";
 import { useAuth } from "@/context/AuthContext";
 import { FileExplorerModal } from "@/components/FileExplorerModal";
 import { RemoteDesktopModal } from "@/components/RemoteDesktopModal";
@@ -23,6 +23,7 @@ import {
   AlertTriangle,
   FolderOpen,
   MonitorSmartphone,
+  Power,
 } from "lucide-react";
 
 interface ScreenCardProps {
@@ -39,9 +40,52 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
   const [showRemote, setShowRemote] = useState(false);
   const [customMedia, setCustomMedia] = useState("C:\\videos\\promo_verano.mp4");
   const [customVolume, setCustomVolume] = useState(screen.volume || 80);
+  const [waking, setWaking] = useState(false);
+  const [wakeCountdown, setWakeCountdown] = useState(0);
 
   const isOnline = screen.status.toLowerCase() === "online";
   const isPlaying = isOnline && screen.currentMedia && screen.currentMedia !== "idle";
+
+  // La pantalla se despertó: se limpia el estado de espera sin esperar al timeout.
+  useEffect(() => {
+    if (isOnline && waking) {
+      setWaking(false);
+      setWakeCountdown(0);
+    }
+  }, [isOnline, waking]);
+
+  // Cuenta atrás del Wake-on-LAN. Si expira, la pantalla no respondió.
+  useEffect(() => {
+    if (!waking) return;
+
+    if (wakeCountdown <= 0) {
+      setWaking(false);
+      onError(
+        "Sin respuesta",
+        `La pantalla [${screen.id}] no respondió al Magic Packet. Revisa WOL en la BIOS y el Inicio Rápido de Windows.`
+      );
+      return;
+    }
+
+    const timer = setTimeout(() => setWakeCountdown((value) => value - 1), 1000);
+    return () => clearTimeout(timer);
+  }, [waking, wakeCountdown, screen.id, onError]);
+
+  const canWake =
+    isAdmin &&
+    Boolean(screen.macAddress) &&
+    screen.wolEnabled !== false &&
+    screen.isWired !== false;
+
+  const wakeHint = !isAdmin
+    ? "Solo administradores"
+    : !screen.macAddress
+    ? "La pantalla aún no ha reportado su MAC: actualiza el agente para poder despertarla"
+    : screen.wolEnabled === false
+    ? "Wake-on-LAN deshabilitado para esta pantalla"
+    : screen.isWired === false
+    ? "Conectada por Wi-Fi: el Wake-on-LAN no funciona por inalámbrico"
+    : "Enviar un Magic Packet para encender la pantalla";
 
   const handleCommand = async (type: string, payload?: Record<string, unknown>) => {
     if (!isAdmin) {
@@ -85,6 +129,33 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
 
   const handleVolumeSubmit = () => {
     handleCommand("volume", { volume: customVolume });
+  };
+
+  const handleWake = async () => {
+    if (!isAdmin) {
+      onError("Permisos insuficientes", "Tu cuenta es Viewer: no puede encender pantallas.");
+      return;
+    }
+
+    try {
+      setLoadingAction("wake");
+      const result = await wakeScreen(screen.id);
+
+      setWaking(true);
+      setWakeCountdown(45);
+
+      onSuccess(
+        "Magic Packet enviado",
+        result.mode === "peer" && result.relayScreenId
+          ? `Encendiendo [${screen.id}] a través de la pantalla ${result.relayScreenId}...`
+          : `Encendiendo [${screen.id}] desde el servidor...`
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Error al solicitar el encendido";
+      onError("No se pudo encender", msg);
+    } finally {
+      setLoadingAction(null);
+    }
   };
 
   // Formato de tiempo relativo simple
@@ -198,6 +269,15 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
                 {screen.name || screen.id}
               </h3>
               <p className="text-xs font-mono text-zinc-400 mt-0.5">{screen.id}</p>
+              {screen.macAddress && (
+                <p
+                  className="text-[10px] font-mono text-zinc-500 mt-0.5 truncate"
+                  title={`MAC ${screen.macAddress}${screen.localIp ? ` · IP ${screen.localIp}` : ""}`}
+                >
+                  {screen.macAddress}
+                  {screen.localIp ? ` · ${screen.localIp}` : ""}
+                </p>
+              )}
               {screen.groupName && (
                 <span className="inline-flex items-center mt-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium bg-sky-500/10 text-sky-300 border border-sky-500/25">
                   {screen.groupName}
@@ -342,6 +422,19 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
               <span>Stop</span>
             </button>
           </div>
+
+          {/* Encendido remoto (solo si la pantalla está apagada) */}
+          {!isOnline && (
+            <button
+              onClick={handleWake}
+              disabled={!canWake || waking || loadingAction === "wake"}
+              className="mt-2 w-full flex items-center justify-center gap-2 py-3 px-3 rounded-xl font-semibold text-xs bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white transition-all active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none border border-amber-400/40 shadow-lg shadow-amber-950/60"
+              title={wakeHint}
+            >
+              <Power className={`w-4 h-4 ${waking ? "animate-pulse" : ""}`} />
+              <span>{waking ? `Despertando… ${wakeCountdown}s` : "Encender (Wake-on-LAN)"}</span>
+            </button>
+          )}
 
           {/* Explorador de archivos y acciones de sistema */}
           <div className="mt-2 grid grid-cols-2 gap-2">

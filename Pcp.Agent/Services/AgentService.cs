@@ -24,6 +24,8 @@ public class AgentService : BackgroundService
     private readonly SystemCommandService _systemCommands;
     private readonly VncRemoteControlService _remoteControl;
     private readonly AgentTokenProvider _tokens;
+    private readonly NetworkInfoProvider _networkInfo;
+    private readonly WakeOnLanSender _wakeOnLan;
 
     private HubConnection? _hubConnection;
 
@@ -33,7 +35,9 @@ public class AgentService : BackgroundService
         FileService fileService,
         SystemCommandService systemCommands,
         VncRemoteControlService remoteControl,
-        AgentTokenProvider tokens)
+        AgentTokenProvider tokens,
+        NetworkInfoProvider networkInfo,
+        WakeOnLanSender wakeOnLan)
     {
         _config = config;
         _logger = logger;
@@ -41,6 +45,8 @@ public class AgentService : BackgroundService
         _systemCommands = systemCommands;
         _remoteControl = remoteControl;
         _tokens = tokens;
+        _networkInfo = networkInfo;
+        _wakeOnLan = wakeOnLan;
         _playerManager = new VlcPlayerManager(config);
 
         // El túnel VNC suspende el kiosco mientras el operador usa el escritorio.
@@ -59,10 +65,16 @@ public class AgentService : BackgroundService
         AgentLog.Info($"   Servidor: {serverUrl}");
         AgentLog.Info($"   Reproductor Kiosco: LibVLC (Hardware Acceleration)");
         AgentLog.Info($"   Control remoto VNC: {(_remoteControl.IsAvailable ? "disponible" : "NO disponible")}");
+
+        // Datos de red para Wake-on-LAN: se detectan una vez al arrancar y se
+        // refrescan al reconectar y cada minuto al enviar el heartbeat.
+        var network = _networkInfo.Refresh();
+        AgentLog.Info($"   Red: {network.Describe()}");
+
         AgentLog.Info("==================================================");
 
         // 1. Intentar pre-registro REST en el servidor
-        await TryRegisterRestAsync(serverUrl, screenId, screenName, token, stoppingToken);
+        await TryRegisterRestAsync(serverUrl, screenId, screenName, token, network, stoppingToken);
 
         // 2. Configuración de conexión SignalR con política de reconexión automática.
         // La identidad viaja en el JWT obtenido tras el registro; SignalR lo adjunta
@@ -107,6 +119,10 @@ public class AgentService : BackgroundService
         _hubConnection.Reconnected += connectionId =>
         {
             AgentLog.Info($"[CONECTADO] Reconexión exitosa al Hub. Nuevo ConnectionId: {connectionId}");
+
+            // La red pudo cambiar mientras el agente estaba desconectado (DHCP,
+            // cambio de adaptador): se vuelve a detectar para el próximo heartbeat.
+            AgentLog.Info($"[RED] {_networkInfo.Refresh().Describe()}");
             return Task.CompletedTask;
         };
 
@@ -218,14 +234,25 @@ public class AgentService : BackgroundService
     /// <summary>
     /// Intenta registrar o verificar la pantalla mediante la API REST previa a la conexión del Hub.
     /// </summary>
-    private async Task TryRegisterRestAsync(string serverUrl, string screenId, string name, string token, CancellationToken ct)
+    private async Task TryRegisterRestAsync(
+        string serverUrl,
+        string screenId,
+        string name,
+        string token,
+        NetworkInfo network,
+        CancellationToken ct)
     {
         using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
         var registerDto = new RegisterDto
         {
             ScreenId = screenId,
             Name = name,
-            Token = token
+            Token = token,
+            MacAddress = network.MacAddress,
+            LocalIp = network.LocalIp,
+            SubnetMask = network.SubnetMask,
+            NetworkCidr = network.NetworkCidr,
+            IsWired = network.IsWired
         };
 
         var json = JsonSerializer.Serialize(registerDto);
@@ -346,6 +373,7 @@ public class AgentService : BackgroundService
         var (cpu, ram, freeDiskMb) = SampleSystemMetrics();
         var currentMedia = _playerManager.CurrentMedia;
         var volume = _playerManager.Volume;
+        var network = _networkInfo.Get();
 
         var heartbeat = new HeartbeatDto
         {
@@ -357,7 +385,12 @@ public class AgentService : BackgroundService
             RamPercent = ram,
             FreeDiskMb = freeDiskMb,
             HdmiOk = true,
-            RemoteControlAvailable = _remoteControl.IsAvailable
+            RemoteControlAvailable = _remoteControl.IsAvailable,
+            MacAddress = network.MacAddress,
+            LocalIp = network.LocalIp,
+            SubnetMask = network.SubnetMask,
+            NetworkCidr = network.NetworkCidr,
+            IsWired = network.IsWired
         };
 
         try
@@ -605,6 +638,36 @@ public class AgentService : BackgroundService
                     var lockResult = _systemCommands.LockSession();
                     status = lockResult.Success ? "ok" : "error";
                     detail = lockResult.Detail;
+                    break;
+
+                case "wake":
+                    // El servidor (en la nube) no alcanza la LAN: le encarga a este
+                    // agente, que está en la misma red, difundir el Magic Packet.
+                    WolPayload? wolPayload = null;
+                    if (!string.IsNullOrWhiteSpace(command.PayloadJson))
+                    {
+                        try
+                        {
+                            wolPayload = JsonSerializer.Deserialize<WolPayload>(command.PayloadJson,
+                                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning("Error deserializando WolPayload: {Message}", ex.Message);
+                        }
+                    }
+
+                    if (wolPayload == null || string.IsNullOrWhiteSpace(wolPayload.MacAddress))
+                    {
+                        status = "error";
+                        detail = "Comando wake sin MAC destino válida.";
+                        AgentLog.Error($"[WOL] {detail}");
+                        break;
+                    }
+
+                    var wolResult = _wakeOnLan.Send(wolPayload);
+                    status = wolResult.Success ? "ok" : "error";
+                    detail = wolResult.Detail;
                     break;
 
                 case "kiosk-pause":

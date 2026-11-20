@@ -82,6 +82,7 @@ public class ScreenHub : Hub
 
             screen.Status = "online";
             screen.LastHeartbeat = DateTime.UtcNow;
+            screen.LastConnectionAt = DateTime.UtcNow;
             await _db.SaveChangesAsync();
 
             _connectionManager.RegisterConnection(screenId, Context.ConnectionId);
@@ -173,6 +174,29 @@ public class ScreenHub : Hub
         screen.RamPercent = dto.RamPercent;
         screen.FreeDiskMb = dto.FreeDiskMb;
 
+        // Datos de red para Wake-on-LAN. Los agentes antiguos envían null y no
+        // deben borrar lo que reportó el agente nuevo la última vez.
+        var mac = NetworkData.NormalizeMac(dto.MacAddress);
+        if (mac != null)
+        {
+            screen.MacAddress = mac;
+        }
+
+        var (localIp, subnetMask, networkCidr) = NetworkData.NormalizeNetwork(
+            dto.LocalIp, dto.SubnetMask, dto.NetworkCidr);
+
+        if (localIp != null)
+        {
+            screen.LocalIp = localIp;
+            screen.SubnetMask = subnetMask;
+            screen.NetworkCidr = networkCidr;
+        }
+
+        if (dto.IsWired.HasValue)
+        {
+            screen.IsWired = dto.IsWired.Value;
+        }
+
         await _db.SaveChangesAsync();
 
         _remoteControlAvailable[screen.Id] = dto.RemoteControlAvailable;
@@ -197,6 +221,11 @@ public class ScreenHub : Hub
             CpuPercent = screen.CpuPercent,
             RamPercent = screen.RamPercent,
             FreeDiskMb = screen.FreeDiskMb,
+            MacAddress = screen.MacAddress,
+            LocalIp = screen.LocalIp,
+            LastConnectionAt = screen.LastConnectionAt,
+            WolEnabled = screen.WolEnabled,
+            IsWired = screen.IsWired,
             ThumbnailBase64 = GetLatestThumbnail(screen.Id),
             RemoteControlAvailable = dto.RemoteControlAvailable
         };

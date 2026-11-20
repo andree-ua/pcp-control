@@ -220,6 +220,34 @@ El archivo, si está, se lee desde la misma carpeta que `Pcp.Agent.exe`.
 
 ---
 
+## ⏻ Encendido remoto (Wake-on-LAN)
+
+El servidor vive en la nube y un Magic Packet no cruza Internet, así que el
+paquete lo emite **otro agente encendido de la misma red**:
+
+1. El agente detecta su NIC física (excluye Hyper-V, VMware, VPN, WSL, Docker…)
+   y reporta MAC/IP/máscara/CIDR al registrarse y en cada heartbeat.
+2. Al pulsar **Encender** en una tarjeta offline, el servidor elige un agente
+   online con la misma `NetworkCidr` (prefiere el cableado) y le envía el
+   comando `wake`.
+3. Ese agente difunde el paquete (102 bytes) a `255.255.255.255:9`, al broadcast
+   dirigido (`192.168.1.255:9`) y a la última IP conocida, 3 repeticiones.
+
+Requisitos en el stick: WOL activo en BIOS/UEFI, driver de red con *Wake on
+Magic Packet* y **Inicio Rápido de Windows desactivado** (con hibernación, S5 no
+despierta). Por Wi-Fi no funciona: el panel deshabilita el botón si
+`isWired = false`.
+
+Sin ningún agente encendido en esa red no hay quién emita el paquete; la API
+responde **503** con un mensaje accionable. Para sedes con una sola pantalla se
+puede dejar un stick siempre encendido y fijarlo con `Wol:PreferredRelayScreenId`.
+
+Configuración: `Wol:CooldownSeconds` (20 s por pantalla), `Wol:Port` (9),
+`Wol:DirectSendEnabled` (false; solo útil si el servidor está en la LAN) y
+`Agent:Wol:InterfaceName` / `Agent:Wol:MacOverride` para forzar la NIC.
+
+---
+
 ## ☁ Despliegue en producción
 
 ### 1. Base de datos MySQL 8 (Aiven / Clever Cloud)

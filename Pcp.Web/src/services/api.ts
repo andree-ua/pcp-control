@@ -1,4 +1,4 @@
-import { CommandRequest, CommandResponse, RemoteSession, ScreenInfo } from "@/types/screen";
+import { CommandRequest, CommandResponse, RemoteSession, ScreenInfo, WakeResponse } from "@/types/screen";
 import { FileListing, FileOperationResponse } from "@/types/files";
 import { GroupCommandResponse, GroupInfo, GroupUpsert } from "@/types/group";
 
@@ -76,6 +76,32 @@ export async function sendScreenCommand(
   }
 
   return data;
+}
+
+/**
+ * Enciende una pantalla apagada mediante Wake-on-LAN.
+ * El servidor encarga el Magic Packet a otro agente online de la misma red.
+ */
+export async function wakeScreen(screenId: string, relayScreenId?: string): Promise<WakeResponse> {
+  const response = await apiFetch(
+    `${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/wake`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ relayScreenId: relayScreenId ?? null }),
+    }
+  );
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(data?.error || `No se pudo encender la pantalla (HTTP ${response.status})`);
+  }
+
+  return data as WakeResponse;
 }
 
 export async function fetchFiles(screenId: string, path?: string): Promise<FileListing> {

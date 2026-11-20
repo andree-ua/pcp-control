@@ -64,6 +64,7 @@ builder.Services.AddSingleton<IFileRequestManager, FileRequestManager>();
 // Sesiones de control remoto (túnel VNC panel ↔ agente)
 builder.Services.AddSingleton<IVncSessionManager, VncSessionManager>();
 builder.Services.AddScoped<ScreenCommandService>();
+builder.Services.AddScoped<WakeOnLanService>();
 builder.Services.AddSingleton<TokenService>();
 builder.Services.AddSignalR(options =>
 {

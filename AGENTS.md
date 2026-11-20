@@ -1,7 +1,7 @@
 # AGENTS.md — PCP (Panel de Control de Pantallas)
 
 Mapa de arquitectura y reglas de negocio del proyecto. **Léelo antes de tocar código.**
-Última actualización: 2026-11-20 (Fase 0–3 completas + Bloque 1 de Fase 3: JWT, roles y login del panel + Bloque 2, paso 1/6: contratos y columnas de Wake-on-LAN).
+Última actualización: 2026-11-20 (Fase 0–3 completas + Bloque 1 de Fase 3: JWT, roles y login del panel + Bloque 2: Wake-on-LAN operativo con relay entre agentes).
 
 ---
 
@@ -68,6 +68,8 @@ C:\Proyectos\Pcp\
 │  ├─ Services\ScreenConnectionManager.cs, OfflineCheckerService.cs
 │  ├─ Services\FileRequestManager.cs  ← correlación requestId ↔ respuesta del agente
 │  ├─ Services\ScreenCommandService.cs ← envío/persistencia de comandos compartido
+│  ├─ Services\WakeOnLanService.cs    ← relay de Magic Packets y envío directo opcional
+│  ├─ Services\NetworkData.cs         ← normalización de MAC/IP/CIDR y broadcast dirigido
 │  ├─ Services\VncSessionManager.cs   ← sesiones VNC y puente WS panel ↔ agente
 │  ├─ Controllers\RemoteControlController.cs ← start/stop del escritorio remoto
 │  ├─ appsettings.json        ← SQLite de desarrollo (fallback)
@@ -82,6 +84,8 @@ C:\Proyectos\Pcp\
 │  ├─ Services\SystemCommandService.cs ← apagado, reinicio, monitor y bloqueo
 │  ├─ Services\VncServerManager.cs    ← detecta/aprovisiona y arranca TightVNC local
 │  ├─ Services\VncRemoteControlService.cs ← túnel WebSocket saliente hacia el servidor
+│  ├─ Services\NetworkInfoProvider.cs ← detecta MAC/IP/máscara/CIDR de la NIC física (WOL)
+│  ├─ Services\WakeOnLanSender.cs     ← emite Magic Packets por encargo del servidor (relay)
 │  ├─ Services\VlcPlayerManager.cs    ← ventana kiosco + LibVLC + captura
 │  └─ appsettings.json        ← opcional; las variables PCP_* tienen prioridad
 └─ Pcp.Web\                   ← Next.js 14 App Router + Tailwind + SignalR client
@@ -127,6 +131,7 @@ C:\Proyectos\Pcp\
 | GET | `/api/screens/{id}` | Detalle de una pantalla; 404 con `{ error }` si no existe. |
 | POST | `/api/screens/register` | Crea pantalla (Name/Token por defecto) o actualiza `Name`. Devuelve `{ screenId, token, isNew }`. Exige `ScreenId`. |
 | POST | `/api/screens/{id}/command` | Valida `type`, busca pantalla y `ConnectionId`; si no está conectada → 400. Persiste `Command` (`pending`), emite `SendCommandToAgent` al ConnectionId, marca `sent`. Devuelve `{ commandId, status, screenId, type }`. |
+| POST | `/api/screens/{id}/wake` | Wake-on-LAN. Solo `Admin`. Valida MAC/IP/cableado y que esté offline; elige un agente online de la misma `NetworkCidr` y le envía el comando `wake` (modo `peer`). Con `Wol:DirectSendEnabled` emite el paquete desde el servidor si no hay relay. Devuelve `{ requested, mode, relayScreenId, macAddress, broadcastAddress, commandId, retryAfterSeconds }`. Errores: 404/400/409 (ya online)/429 (cooldown)/503 (sin relay)/500. |
 
 Reglas del comando:
 - `payload` puede llegar como `JsonElement` o como objeto; se normaliza a `PayloadJson` (string JSON) antes de guardar/enviar.
@@ -254,11 +259,11 @@ Reglas de autenticación:
 ### Ciclo de vida (`AgentService.ExecuteAsync`)
 0. `Program.cs` (WinExe, sin consola) inicializa `AgentLog` en `C:\ProgramData\PcpAgent\agent.log`, redirige `Console.*` al archivo, registra solo el proveedor de archivo para `ILogger` y toma el mutex `Local\PcpAgent-{screenId}` (segunda instancia → termina).
 1. Lee config `Agent:*` (defaults: `screen-01`, `Pantalla screen-01`, `dev-token`, `http://localhost:5000`) desde `appsettings.json` junto al `.exe` (opcional), variables estándar (`Agent__ServerUrl`), prefijo `PCP_` (`PCP_Agent__ServerUrl`) o atajos `PCP_SERVER_URL` / `PCP_SCREEN_ID` / `PCP_SCREEN_NAME` / `PCP_TOKEN`.
-2. `POST /api/screens/register` hasta 3 intentos (timeout 5 s); si falla, continúa.
+2. `POST /api/screens/register` hasta 3 intentos (timeout 5 s); si falla, continúa. Envía también MAC/IP/máscara/CIDR/`IsWired` de la NIC física detectada por `NetworkInfoProvider`.
 3. Construye URL del Hub con `screenId` y `token` en query y `WithAutomaticReconnect` (0, 2, 5, 10, 20 s).
 4. `ConnectWithRetryAsync`: reintenta cada 3 s hasta conectar.
 5. Tarea independiente de miniaturas cada **5 s** (más una inmediata al conectar).
-6. Bucle principal de heartbeat cada **10 s** (incluye `RemoteControlAvailable`).
+6. Bucle principal de heartbeat cada **10 s** (incluye `RemoteControlAvailable` y los datos de red para Wake-on-LAN; `NetworkInfoProvider` los refresca cada 60 s por si cambia el DHCP).
 7. Escucha `OpenVncTunnel`/`CloseVncTunnel` para el escritorio remoto.
 8. Al cancelar: `StopAsync`/`DisposeAsync` del Hub, `VncRemoteControlService.StopAllAsync()` y `VlcPlayerManager.Dispose()`.
 
@@ -318,6 +323,7 @@ Reglas de autenticación:
 | `stop` | `Stop()` y `CurrentMedia = "idle"`; emite thumbnail inmediata. | Detenido |
 | `volume` | Lee `volume`/`Volume` del JSON (case-insensitive vía TryGetProperty de ambas variantes) y aplica clamp 0–100. | Volumen ajustado |
 | `kiosk-pause` / `kiosk-resume` | Alias `pausekiosk`, `kiosk_pause`, `pause_kiosk` y `resumekiosk`, `kiosk_resume`, `resume_kiosk`. Suspende o reanuda el kiosco con el motivo `manual` (minimiza y quita `TopMost`). | Kiosco suspendido / reanudado |
+| `wake` | Deserializa `WolPayload` y emite el Magic Packet (102 bytes: 6×`0xFF` + MAC×16) a `255.255.255.255:9`, al broadcast dirigido y a la última IP conocida, 3 repeticiones. | "Magic packet enviado a ... para AA:BB:..." |
 | `shutdown` / `restart` | **Simulados** por seguridad (no ejecutan nada). | "deshabilitado por seguridad" |
 | otro | `status = "error"` | Comando no soportado |
 
@@ -378,7 +384,8 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
 ### Componentes
 - `Header.tsx`: logo, badge de estado SignalR (`connected`/`reconnecting`/`disconnected`) y botón Refrescar.
 - `SummaryBar.tsx`: total, online, offline y "en reproducción" (online y `currentMedia !== "idle"`).
-- `ScreenCard.tsx`: monitor 16:9 con thumbnail en vivo (badge EN VIVO/STANDBY), efecto "SIN SEÑAL" con barras SMPTE si offline, nombre/ID, badge online, medio actual, CPU/RAM/Disco/Latido, botones Play/Pausar/Stop y panel "Configurar medio / volumen" (ruta local o URL + slider 0–100).
+- `ScreenCard.tsx`: monitor 16:9 con thumbnail en vivo (badge EN VIVO/STANDBY), efecto "SIN SEÑAL" con barras SMPTE si offline, nombre/ID, MAC e IP (mono, solo si el agente las reportó), badge online, medio actual, CPU/RAM/Disco/Latido, botones Play/Pausar/Stop y panel "Configurar medio / volumen" (ruta local o URL + slider 0–100).
+  - Si la pantalla está **offline** aparece **Encender (Wake-on-LAN)**: pide `POST /wake`, muestra cuenta atrás de 45 s y se limpia sola cuando llega el `ScreenStatusChanged` a online. Se deshabilita sin MAC, con `wolEnabled = false` o si `isWired = false` (Wi-Fi), con tooltip explicativo.
   - `Play` envía `{ mediaPath, loop: true, volume, fitMode: "cover" }`.
   - `Pausar` → `pause`; `Stop` → `stop`; "Aplicar volumen" → `{ volume }`.
   - Ruta por defecto en el input: `C:\videos\promo_verano.mp4`.
@@ -402,6 +409,7 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
 - `SERVER_URL` = `NEXT_PUBLIC_API_URL` → `NEXT_PUBLIC_SERVER_URL` → `http://localhost:5000`, sin barra final. `NEXT_PUBLIC_*` se incrusta en **build**; en producción debe venir de `.env.production` o del panel de la nube.
 - `fetchScreens()`: `GET /api/screens`, `cache: "no-store"`.
 - `sendScreenCommand(id, { type, payload })`: `POST /api/screens/{id}/command`; propaga `data.error` del servidor.
+- `wakeScreen(id, relayScreenId?)`: `POST /api/screens/{id}/wake`; devuelve `{ mode, relayScreenId, macAddress, ... }`. El panel usa `mode` para el mensaje del toast.
 - `fetchFiles(screenId, path?)`, `deleteFile(screenId, path)` y `uploadFile(screenId, directoryPath, file)`: consumen `/api/screens/{id}/files`.
 - `uploadFileWithProgress(screenId, directoryPath, file, { onBrowserProgress, signal })`: sube con `XMLHttpRequest` (progreso real navegador → servidor, cancelable con `AbortController`) y devuelve `{ clientRequestId, promise }`. El tramo servidor → agente se sigue con `subscribeUploadProgress(clientRequestId, cb)` (evento SignalR `FileUploadProgress`). `uploadFile` se mantiene como envoltorio sin progreso.
 - `startRemoteSession(screenId, viewOnly)` y `stopRemoteSession(screenId, sessionId?)`: consumen `/api/screens/{id}/remote/{start|stop}`.
@@ -433,7 +441,7 @@ Espejo camelCase de los DTOs: `ScreenInfo` (incluye `remoteControlAvailable`), `
 15. **Caducidad de sesión**: 90 s para que el panel abra el WebSocket; luego indefinida hasta 12 h. Cerrar el modal, cerrar el WebSocket, desconectar el agente o reiniciar el servidor cierra el túnel y restaura la configuración de TightVNC.
 16. **Dependencia externa**: TightVNC debe existir en la mini-PC (o aprovisionarse desde `Agent:Vnc:PackagePath`). El agente debe correr en la sesión interactiva; un servicio de TightVNC activo impide el modo aplicación y se reporta como error al panel.
 17. **Rendimiento**: noVNC usa `scaleViewport`, `qualityLevel≈6` y `compressionLevel≈1`; TightVNC se configura con captura D3D y sin transferencia de archivos. En LAN da ~30–60 fps a 1080p. No se envía audio, portapapeles ni archivos por este canal.
-18. **Wake-on-LAN (Bloque 2, en curso)**: un Magic Packet no cruza Internet, y el servidor vive en Render, así que el paquete lo emite **otro agente online de la misma `NetworkCidr`** (relay) al recibir el comando `wake`; el envío directo desde el servidor queda como modo opcional (`Wol:DirectSendEnabled`) para despliegues on-prem. Si no hay relay disponible no se puede despertar la pantalla. Estado: contratos y columnas desplegados; endpoint, servicio y UI pendientes.
+18. **Wake-on-LAN**: un Magic Packet no cruza Internet, y el servidor vive en Render, así que el paquete lo emite **otro agente online de la misma `NetworkCidr`** (relay) al recibir el comando `wake`; el envío directo desde el servidor es opcional (`Wol:DirectSendEnabled`, solo útil on-prem). Si no hay relay disponible no se puede despertar. El endpoint exige `Admin`, aplica cooldown (`Wol:CooldownSeconds`) y audita el `wake` en `Commands`. Por Wi-Fi el WOL no funciona: el panel deshabilita el botón cuando `IsWired = false`.
 
 ---
 
@@ -462,9 +470,9 @@ powershell -ExecutionPolicy Bypass -File C:\Proyectos\Pcp\scripts\publish-agent.
 ```
 
 Claves de configuración relevantes:
-- `Pcp.Server/appsettings.json` → `Database:MySqlVersion`, `ConnectionStrings:DefaultConnection` (SQLite dev), `Files:MaxUploadMb`, `Auth:*` (emisor, audiencia, cookie, duración de tokens, usuario admin inicial).
+- `Pcp.Server/appsettings.json` → `Database:MySqlVersion`, `ConnectionStrings:DefaultConnection` (SQLite dev), `Files:MaxUploadMb`, `Wol:*` (`Enabled`, `CooldownSeconds`, `Port`, `DirectSendEnabled`, `PreferredRelayScreenId`), `Auth:*` (emisor, audiencia, cookie, duración de tokens, usuario admin inicial).
 - `Pcp.Server/appsettings.Production.json` → `Database:Provider=MySql`, `Cors:AllowedOrigins`, `Auth:CookieSameSite=None`. La cadena real y `Auth__SigningKey` **nunca** se versionan: usar `ConnectionStrings__MySql` o `DATABASE_URL`/`MYSQL_URL`/`MYSQL_ADDON_URI`, más `Auth__SigningKey`, `Auth__AdminPassword`, `Cors__AllowedOrigins__0..N`, `PORT` y `Files__MaxUploadMb`.
-- `Pcp.Agent/appsettings.json` (opcional) → `Agent:ScreenId`, `Agent:Name`, `Agent:Token`, `Agent:ServerUrl`, `Agent:DevMode`, `Agent:AllowSystemCommands`, `Agent:SystemCommandDelaySeconds`, `Agent:FileRoots`, `Agent:ProtectedPaths`, `Agent:MaxUploadMb`, `Agent:LogPath`, `Agent:Kiosk:TopMostOnlyWhilePlaying`, `Agent:Kiosk:IdleWindowState`, `Agent:Vnc:*`. Se puede omitir y usar `PCP_SERVER_URL`, `PCP_SCREEN_ID`, `PCP_SCREEN_NAME`, `PCP_TOKEN` o `PCP_Agent__*`.
+- `Pcp.Agent/appsettings.json` (opcional) → `Agent:ScreenId`, `Agent:Name`, `Agent:Token`, `Agent:ServerUrl`, `Agent:DevMode`, `Agent:AllowSystemCommands`, `Agent:SystemCommandDelaySeconds`, `Agent:FileRoots`, `Agent:ProtectedPaths`, `Agent:MaxUploadMb`, `Agent:LogPath`, `Agent:Kiosk:TopMostOnlyWhilePlaying`, `Agent:Kiosk:IdleWindowState`, `Agent:Vnc:*`, `Agent:Wol:InterfaceName` y `Agent:Wol:MacOverride` (overrides manuales de la NIC para WOL; el override por nombre selecciona esa interfaz aunque parezca virtual). Se puede omitir y usar `PCP_SERVER_URL`, `PCP_SCREEN_ID`, `PCP_SCREEN_NAME`, `PCP_TOKEN` o `PCP_Agent__*`.
 - `Pcp.Web/.env.local` (dev) y `Pcp.Web/.env.production` (build) → `NEXT_PUBLIC_API_URL` (y `NEXT_PUBLIC_SERVER_URL`).
 - `.env.example` en la raíz documenta todas las variables de producción.
 
