@@ -1,0 +1,21 @@
+# Contexto de build: raíz del repositorio.
+# Excluir artefactos locales para que el build de Render sea rápido y reproducible.
+**/bin/
+**/obj/
+**/node_modules/
+**/.next/
+**/.next-*/
+**/publish/
+**/pcp.db
+**/pcp.db-shm
+**/pcp.db-wal
+**/.vs/
+**/.vscode/
+**/.idea/
+**/.git/
+**/.gitignore
+**/.env
+**/.env.local
+**/*.user
+**/*.suo
+**/TestResults/
