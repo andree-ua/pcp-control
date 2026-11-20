@@ -84,13 +84,31 @@ namespace Pcp.Server.Data.Migrations
                     b.Property<Guid?>("GroupId")
                         .HasColumnType("char(36)");
 
+                    b.Property<bool?>("IsWired")
+                        .HasColumnType("tinyint(1)");
+
+                    b.Property<DateTime?>("LastConnectionAt")
+                        .HasColumnType("datetime(6)");
+
                     b.Property<DateTime>("LastHeartbeat")
                         .HasColumnType("datetime(6)");
+
+                    b.Property<string>("LocalIp")
+                        .HasMaxLength(45)
+                        .HasColumnType("varchar(45)");
+
+                    b.Property<string>("MacAddress")
+                        .HasMaxLength(17)
+                        .HasColumnType("varchar(17)");
 
                     b.Property<string>("Name")
                         .IsRequired()
                         .HasMaxLength(100)
                         .HasColumnType("varchar(100)");
+
+                    b.Property<string>("NetworkCidr")
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
 
                     b.Property<double>("RamPercent")
                         .HasColumnType("double");
@@ -100,6 +118,10 @@ namespace Pcp.Server.Data.Migrations
                         .HasMaxLength(20)
                         .HasColumnType("varchar(20)");
 
+                    b.Property<string>("SubnetMask")
+                        .HasMaxLength(45)
+                        .HasColumnType("varchar(45)");
+
                     b.Property<string>("Token")
                         .IsRequired()
                         .HasMaxLength(128)
@@ -108,9 +130,14 @@ namespace Pcp.Server.Data.Migrations
                     b.Property<int>("Volume")
                         .HasColumnType("int");
 
+                    b.Property<bool>("WolEnabled")
+                        .HasColumnType("tinyint(1)");
+
                     b.HasKey("Id");
 
                     b.HasIndex("GroupId");
+
+                    b.HasIndex("NetworkCidr");
 
                     b.ToTable("Screens");
                 });

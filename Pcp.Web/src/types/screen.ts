@@ -12,6 +12,11 @@ export interface ScreenInfo {
   freeDiskMb: number;
   thumbnailBase64?: string;
   remoteControlAvailable?: boolean;
+  macAddress?: string | null;
+  localIp?: string | null;
+  lastConnectionAt?: string | null;
+  wolEnabled?: boolean;
+  isWired?: boolean | null;
 }
 
 /**
@@ -31,6 +36,16 @@ export interface ThumbnailDto {
   screenId: string;
   thumbnailBase64: string;
   timestamp: string;
+}
+
+export interface WakeResponse {
+  requested: boolean;
+  mode: "peer" | "direct" | string;
+  relayScreenId?: string | null;
+  macAddress: string;
+  broadcastAddress?: string | null;
+  commandId?: string | null;
+  retryAfterSeconds: number;
 }
 
 export interface CommandRequest {

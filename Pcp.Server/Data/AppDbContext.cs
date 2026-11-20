@@ -38,6 +38,12 @@ public class AppDbContext : DbContext
             entity.Property(s => s.Token).HasMaxLength(128).IsRequired();
             entity.Property(s => s.Status).HasMaxLength(20).IsRequired();
             entity.Property(s => s.CurrentMedia).HasMaxLength(500);
+            entity.Property(s => s.MacAddress).HasMaxLength(17);
+            entity.Property(s => s.LocalIp).HasMaxLength(45);
+            entity.Property(s => s.SubnetMask).HasMaxLength(45);
+            entity.Property(s => s.NetworkCidr).HasMaxLength(64);
+            // Índice para localizar rápidamente agentes de la misma red (relay de Wake-on-LAN).
+            entity.HasIndex(s => s.NetworkCidr);
             entity.Ignore(s => s.ThumbnailBase64);
             entity.HasOne(s => s.Group)
                   .WithMany(g => g.Screens)

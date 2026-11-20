@@ -43,4 +43,19 @@ public class ScreenInfo
 
     /// <summary>Indica si la pantalla puede abrir una sesión de control remoto (VNC).</summary>
     public bool RemoteControlAvailable { get; set; }
+
+    /// <summary>MAC de la interfaz física; null si el agente aún no la reportó.</summary>
+    public string? MacAddress { get; set; }
+
+    /// <summary>IP local de la interfaz física.</summary>
+    public string? LocalIp { get; set; }
+
+    /// <summary>Fecha y hora UTC de la última conexión del agente al Hub.</summary>
+    public DateTime? LastConnectionAt { get; set; }
+
+    /// <summary>Indica si la pantalla acepta peticiones de Wake-on-LAN.</summary>
+    public bool WolEnabled { get; set; } = true;
+
+    /// <summary>Indica si la interfaz activa es cableada. Null si el agente no lo informó.</summary>
+    public bool? IsWired { get; set; }
 }

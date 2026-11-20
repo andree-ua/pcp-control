@@ -1,7 +1,7 @@
 # AGENTS.md — PCP (Panel de Control de Pantallas)
 
 Mapa de arquitectura y reglas de negocio del proyecto. **Léelo antes de tocar código.**
-Última actualización: 2026-11-20 (Fase 0–3 completas + Bloque 1 de Fase 3: JWT, roles y login del panel).
+Última actualización: 2026-11-20 (Fase 0–3 completas + Bloque 1 de Fase 3: JWT, roles y login del panel + Bloque 2, paso 1/6: contratos y columnas de Wake-on-LAN).
 
 ---
 
@@ -242,6 +242,7 @@ Reglas de autenticación:
 
 ### Persistencia — `AppDbContext`
 - `Screens` (PK `Id` string ≤50; `Name` ≤100; `Token` ≤128; `Status` ≤20; `CurrentMedia` ≤500; resto telemetría). `ThumbnailBase64` está `[NotMapped]`/`Ignore`.
+  Bloque 2 (Wake-on-LAN): `MacAddress` ≤17, `LocalIp`/`SubnetMask` ≤45, `NetworkCidr` ≤64 (indexado para emparejar relays), `IsWired` bool nullable (null = agente antiguo), `WolEnabled` bool (default `true`) y `LastConnectionAt` datetime nullable.
 - `Commands` (PK `Guid`; `ScreenId` ≤50; `Type` ≤50; `Status` ≤20; `PayloadJson`, `ExecutedAt?`, `ResultDetail` ≤1000).
 - FK `Screens.GroupId → ScreenGroups.Id` con `OnDelete(SetNull)` e índice `IX_Screens_GroupId`.
 - Migración `Data/Migrations/*_InitialCreate.cs` específica de MySQL (`char(36)`, `datetime(6)`, `utf8mb4`, `longtext`). El snapshot se usa con `dotnet ef`; SQLite de desarrollo sigue con `EnsureCreated`.
@@ -432,6 +433,7 @@ Espejo camelCase de los DTOs: `ScreenInfo` (incluye `remoteControlAvailable`), `
 15. **Caducidad de sesión**: 90 s para que el panel abra el WebSocket; luego indefinida hasta 12 h. Cerrar el modal, cerrar el WebSocket, desconectar el agente o reiniciar el servidor cierra el túnel y restaura la configuración de TightVNC.
 16. **Dependencia externa**: TightVNC debe existir en la mini-PC (o aprovisionarse desde `Agent:Vnc:PackagePath`). El agente debe correr en la sesión interactiva; un servicio de TightVNC activo impide el modo aplicación y se reporta como error al panel.
 17. **Rendimiento**: noVNC usa `scaleViewport`, `qualityLevel≈6` y `compressionLevel≈1`; TightVNC se configura con captura D3D y sin transferencia de archivos. En LAN da ~30–60 fps a 1080p. No se envía audio, portapapeles ni archivos por este canal.
+18. **Wake-on-LAN (Bloque 2, en curso)**: un Magic Packet no cruza Internet, y el servidor vive en Render, así que el paquete lo emite **otro agente online de la misma `NetworkCidr`** (relay) al recibir el comando `wake`; el envío directo desde el servidor queda como modo opcional (`Wol:DirectSendEnabled`) para despliegues on-prem. Si no hay relay disponible no se puede despertar la pantalla. Estado: contratos y columnas desplegados; endpoint, servicio y UI pendientes.
 
 ---
 

@@ -31,4 +31,23 @@ public class HeartbeatDto
 
     /// <summary>Indica si el agente tiene un servidor VNC disponible para control remoto.</summary>
     public bool RemoteControlAvailable { get; set; }
+
+    // ── Datos de red para Wake-on-LAN ───────────────────────────────────────
+    // Se reenvían en cada latido porque la IP puede cambiar por DHCP o al
+    // cambiar de adaptador; el servidor solo escribe si el valor cambió.
+
+    /// <summary>MAC de la interfaz física detectada por el agente.</summary>
+    public string? MacAddress { get; set; }
+
+    /// <summary>IP local de la interfaz física.</summary>
+    public string? LocalIp { get; set; }
+
+    /// <summary>Máscara de subred IPv4 de la interfaz física.</summary>
+    public string? SubnetMask { get; set; }
+
+    /// <summary>Red en notación CIDR ("192.168.1.0/24").</summary>
+    public string? NetworkCidr { get; set; }
+
+    /// <summary>Indica si la interfaz activa es cableada (Ethernet) o inalámbrica (Wi-Fi).</summary>
+    public bool? IsWired { get; set; }
 }

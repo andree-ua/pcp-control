@@ -243,6 +243,8 @@ dotnet run
 
 - La URI `mysql://` se convierte automáticamente a cadena ADO.NET (incluye `ssl-mode`).
 - Sin `ASPNETCORE_ENVIRONMENT=Production`, el servidor usa SQLite (`pcp.db`) para desarrollo.
+  `EnsureCreated()` no altera tablas existentes: **si cambia el esquema, borra `Pcp.Server/pcp.db`
+  (y sus `-shm`/`-wal`) antes de arrancar** para que el modelo se recree.
 - Migraciones: `dotnet tool restore` y después
   `dotnet ef migrations add <Nombre> --project Pcp.Server\Pcp.Server.csproj --startup-project Pcp.Server\Pcp.Server.csproj --configuration Release --output-dir Data\Migrations`.
 - El arranque reintenta la conexión MySQL 10 veces (5 s entre intentos) para tolerar el arranque en frío de la nube.
