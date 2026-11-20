@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Pcp.Agent/Pcp.Agent.csproj" />
+  <Project Path="Pcp.Server/Pcp.Server.csproj" />
+  <Project Path="Pcp.Shared/Pcp.Shared.csproj" />
+</Solution>

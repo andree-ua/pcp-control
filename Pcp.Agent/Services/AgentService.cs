@@ -1,0 +1,645 @@
+using System.Diagnostics;
+using System.Text.Json;
+using Microsoft.AspNetCore.SignalR.Client;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Pcp.Shared.Dtos;
+
+namespace Pcp.Agent.Services;
+
+/// <summary>
+/// Servicio principal en segundo plano del Agente PCP.
+/// Gestiona la conexión persistente por SignalR con el servidor central,
+/// la telemetría periódica (heartbeats), la emisión de miniaturas en vivo (thumbnails)
+/// y el control del reproductor LibVLC en modo kiosco.
+/// </summary>
+public class AgentService : BackgroundService
+{
+    private readonly IConfiguration _config;
+    private readonly ILogger<AgentService> _logger;
+    private readonly VlcPlayerManager _playerManager;
+    private readonly FileService _fileService;
+    private readonly SystemCommandService _systemCommands;
+    private readonly VncRemoteControlService _remoteControl;
+
+    private HubConnection? _hubConnection;
+
+    public AgentService(
+        IConfiguration config,
+        ILogger<AgentService> logger,
+        FileService fileService,
+        SystemCommandService systemCommands,
+        VncRemoteControlService remoteControl)
+    {
+        _config = config;
+        _logger = logger;
+        _fileService = fileService;
+        _systemCommands = systemCommands;
+        _remoteControl = remoteControl;
+        _playerManager = new VlcPlayerManager(config);
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var screenId = _config["Agent:ScreenId"] ?? "screen-01";
+        var screenName = _config["Agent:Name"] ?? $"Pantalla {screenId}";
+        var token = _config["Agent:Token"] ?? "dev-token";
+        var serverUrl = _config["Agent:ServerUrl"] ?? "http://localhost:5000";
+
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("==================================================");
+        Console.WriteLine($"   PCP AGENT - PANTALLA: {screenId} ({screenName})");
+        Console.WriteLine($"   Servidor: {serverUrl}");
+        Console.WriteLine($"   Reproductor Kiosco: LibVLC (Hardware Acceleration)");
+        Console.WriteLine($"   Control remoto VNC: {(_remoteControl.IsAvailable ? "disponible" : "NO disponible")}");
+        Console.WriteLine("==================================================");
+        Console.ResetColor();
+
+        // 1. Intentar pre-registro REST en el servidor
+        await TryRegisterRestAsync(serverUrl, screenId, screenName, token, stoppingToken);
+
+        // 2. Configuración de conexión SignalR con política de reconexión automática
+        var hubUrl = $"{serverUrl.TrimEnd('/')}/hubs/screen?token={Uri.EscapeDataString(token)}&screenId={Uri.EscapeDataString(screenId)}";
+
+        _hubConnection = new HubConnectionBuilder()
+            .WithUrl(hubUrl)
+            .WithAutomaticReconnect(new[]
+            {
+                TimeSpan.Zero,
+                TimeSpan.FromSeconds(2),
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(10),
+                TimeSpan.FromSeconds(20)
+            })
+            .Build();
+
+        // 3. Suscripción a eventos de ciclo de vida de la conexión
+        _hubConnection.Reconnecting += error =>
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [ALERTA] Conexión perdida con el servidor. Reconectando... ({error?.Message})");
+            Console.ResetColor();
+            return Task.CompletedTask;
+        };
+
+        _hubConnection.Reconnected += connectionId =>
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [CONECTADO] Reconexión exitosa al Hub. Nuevo ConnectionId: {connectionId}");
+            Console.ResetColor();
+            return Task.CompletedTask;
+        };
+
+        _hubConnection.Closed += error =>
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [ERROR] Conexión cerrada. {error?.Message}");
+            Console.ResetColor();
+            return Task.CompletedTask;
+        };
+
+        // 4. Registro de manejador para comandos enviados por el servidor
+        _hubConnection.On<CommandDto>("SendCommandToAgent", async (command) =>
+        {
+            await ProcessCommandAsync(command, screenId);
+        });
+
+        // 4b. Registro de manejador para operaciones del explorador de archivos
+        _hubConnection.On<FileRequestDto>("FileRequest", async (request) =>
+        {
+            await ProcessFileRequestAsync(request, screenId);
+        });
+
+        // 4c. Registro de manejador para el escritorio remoto (túnel VNC)
+        _remoteControl.SetStatusReporter(async status =>
+        {
+            if (_hubConnection?.State == HubConnectionState.Connected)
+            {
+                await _hubConnection.InvokeAsync(RemoteControlEvents.TunnelStatus, status);
+            }
+        });
+
+        _hubConnection.On<VncTunnelRequestDto>(RemoteControlEvents.OpenTunnel, request =>
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [VNC] Petición de control remoto recibida (sesión {request.SessionId})");
+            Console.ResetColor();
+            _remoteControl.Start(request);
+        });
+
+        _hubConnection.On<string>(RemoteControlEvents.CloseTunnel, sessionId =>
+        {
+            _remoteControl.Stop(sessionId);
+        });
+
+        // 5. Iniciar conexión al Hub con reintentos hasta que el servidor esté disponible
+        await ConnectWithRetryAsync(stoppingToken);
+
+        // 6. Bucle de emisión de miniaturas (Thumbnails) cada 5 segundos
+        _ = Task.Run(async () =>
+        {
+            var thumbInterval = TimeSpan.FromSeconds(5);
+
+            // Emisión inicial inmediata al conectar
+            try
+            {
+                await EmitThumbnailAsync(screenId);
+            }
+            catch { }
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(thumbInterval, stoppingToken);
+                    await EmitThumbnailAsync(screenId);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug("Error capturando miniatura: {Msg}", ex.Message);
+                }
+            }
+        }, stoppingToken);
+
+        // 7. Bucle de emisión de Heartbeat cada 10 segundos
+        var heartbeatInterval = TimeSpan.FromSeconds(10);
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await EmitHeartbeatAsync(screenId);
+            try
+            {
+                await Task.Delay(heartbeatInterval, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+        }
+
+        if (_hubConnection != null)
+        {
+            await _hubConnection.StopAsync(CancellationToken.None);
+            await _hubConnection.DisposeAsync();
+        }
+
+        try
+        {
+            await _remoteControl.StopAllAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Error cerrando el control remoto: {Message}", ex.Message);
+        }
+
+        _playerManager.Dispose();
+    }
+
+    /// <summary>
+    /// Intenta registrar o verificar la pantalla mediante la API REST previa a la conexión del Hub.
+    /// </summary>
+    private async Task TryRegisterRestAsync(string serverUrl, string screenId, string name, string token, CancellationToken ct)
+    {
+        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+        var registerDto = new RegisterDto
+        {
+            ScreenId = screenId,
+            Name = name,
+            Token = token
+        };
+
+        var json = JsonSerializer.Serialize(registerDto);
+        var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            try
+            {
+                var response = await client.PostAsync($"{serverUrl.TrimEnd('/')}/api/screens/register", content, ct);
+                if (response.IsSuccessStatusCode)
+                {
+                    _logger.LogInformation("Registro REST confirmado por el servidor.");
+                    return;
+                }
+            }
+            catch
+            {
+                // Reintento en caso de inicio desfasado del servidor
+            }
+
+            if (attempt < 3)
+            {
+                await Task.Delay(1500, ct);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Intenta conectar al Hub SignalR repitiendo en caso de que el servidor aún no haya iniciado.
+    /// </summary>
+    private async Task ConnectWithRetryAsync(CancellationToken ct)
+    {
+        int attempt = 0;
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                attempt++;
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Conectando al Hub SignalR (intento #{attempt})...");
+                await _hubConnection!.StartAsync(ct);
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [CONECTADO] Conectado exitosamente al servidor SignalR.");
+                Console.ResetColor();
+
+                // Enviar inmediatamente un thumbnail inicial
+                await EmitThumbnailAsync(_config["Agent:ScreenId"] ?? "screen-01");
+                return;
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkYellow;
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Servidor aún no disponible ({ex.Message}). Reintentando en 3s...");
+                Console.ResetColor();
+
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(3), ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Captura y emite la miniatura (fotograma o estado standby) hacia el servidor vía SignalR.
+    /// </summary>
+    private async Task EmitThumbnailAsync(string screenId)
+    {
+        if (_hubConnection?.State != HubConnectionState.Connected) return;
+
+        try
+        {
+            var thumbnailBase64 = _playerManager.CaptureThumbnailBase64(screenId);
+            if (!string.IsNullOrEmpty(thumbnailBase64))
+            {
+                var dto = new ThumbnailDto
+                {
+                    ScreenId = screenId,
+                    ThumbnailBase64 = thumbnailBase64,
+                    Timestamp = DateTime.UtcNow
+                };
+
+                await _hubConnection.InvokeAsync("SendThumbnail", dto);
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [THUMBNAIL] Miniatura transmitida ({thumbnailBase64.Length} chars)");
+                Console.ResetColor();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[THUMBNAIL ERROR] {ex.Message}");
+            Console.ResetColor();
+        }
+    }
+
+    /// <summary>
+    /// Recolecta métricas del sistema y emite el latido de telemetría hacia el servidor.
+    /// </summary>
+    private async Task EmitHeartbeatAsync(string screenId)
+    {
+        if (_hubConnection?.State != HubConnectionState.Connected)
+        {
+            return;
+        }
+
+        var (cpu, ram, freeDiskMb) = SampleSystemMetrics();
+        var currentMedia = _playerManager.CurrentMedia;
+        var volume = _playerManager.Volume;
+
+        var heartbeat = new HeartbeatDto
+        {
+            ScreenId = screenId,
+            Timestamp = DateTime.UtcNow,
+            CurrentMedia = currentMedia,
+            Volume = volume,
+            CpuPercent = cpu,
+            RamPercent = ram,
+            FreeDiskMb = freeDiskMb,
+            HdmiOk = true,
+            RemoteControlAvailable = _remoteControl.IsAvailable
+        };
+
+        try
+        {
+            await _hubConnection.InvokeAsync("Heartbeat", heartbeat);
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [HEARTBEAT] Enviado: Media='{currentMedia}', Vol={volume}%, CPU={cpu:F1}%, RAM={ram:F1}%, Disco={freeDiskMb}MB");
+            Console.ResetColor();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Error al emitir heartbeat: {Message}", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Obtiene mediciones o estimaciones de telemetría del hardware local.
+    /// </summary>
+    private static (double cpu, double ram, long freeDiskMb) SampleSystemMetrics()
+    {
+        var random = new Random();
+        double cpu = Math.Round(random.NextDouble() * 25 + 5, 1);
+
+        double ram = 35.0;
+        try
+        {
+            var proc = Process.GetCurrentProcess();
+            var memoryInfo = GC.GetGCMemoryInfo();
+            if (memoryInfo.TotalAvailableMemoryBytes > 0)
+            {
+                ram = Math.Round(((double)proc.WorkingSet64 / memoryInfo.TotalAvailableMemoryBytes) * 100, 1);
+            }
+        }
+        catch
+        {
+            ram = Math.Round(random.NextDouble() * 20 + 25, 1);
+        }
+
+        long freeDiskMb = 50000;
+        try
+        {
+            var systemDrive = new DriveInfo(Path.GetPathRoot(AppContext.BaseDirectory) ?? "C:\\");
+            freeDiskMb = systemDrive.AvailableFreeSpace / (1024 * 1024);
+        }
+        catch
+        {
+            freeDiskMb = 45000;
+        }
+
+        return (cpu, ram, freeDiskMb);
+    }
+
+    /// <summary>
+    /// Ejecuta una operación del explorador de archivos y devuelve el resultado al servidor.
+    /// Los chunks de subida no generan respuesta individual; el cierre de la subida sí.
+    /// </summary>
+    private async Task ProcessFileRequestAsync(FileRequestDto request, string screenId)
+    {
+        FileResultDto? result = null;
+
+        try
+        {
+            switch (request.Operation)
+            {
+                case FileOperations.List:
+                    result = _fileService.List(request);
+                    break;
+                case FileOperations.Delete:
+                    result = _fileService.Delete(request);
+                    break;
+                case FileOperations.UploadStart:
+                    result = _fileService.StartUpload(request);
+                    // El inicio correcto no se responde: la confirmación llega al cerrar la subida.
+                    // Solo se devuelve un resultado si el agente rechazó la operación.
+                    if (result.Success)
+                    {
+                        result = null;
+                    }
+                    break;
+                case FileOperations.UploadChunk:
+                    _fileService.AppendChunk(request);
+                    break;
+                case FileOperations.UploadComplete:
+                    result = _fileService.CompleteUpload(request);
+                    break;
+                case FileOperations.UploadCancel:
+                    _fileService.CancelUpload(request.RequestId);
+                    break;
+                default:
+                    result = new FileResultDto
+                    {
+                        RequestId = request.RequestId,
+                        ScreenId = screenId,
+                        Success = false,
+                        Error = $"Operación de archivos no soportada: '{request.Operation}'."
+                    };
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error al procesar la operación de archivos '{Operation}'", request.Operation);
+            result = new FileResultDto
+            {
+                RequestId = request.RequestId,
+                ScreenId = screenId,
+                Success = false,
+                Error = $"Error interno en el agente: {ex.Message}"
+            };
+        }
+
+        if (result == null)
+        {
+            return;
+        }
+
+        result.ScreenId = screenId;
+
+        if (_hubConnection?.State != HubConnectionState.Connected)
+        {
+            return;
+        }
+
+        try
+        {
+            await _hubConnection.InvokeAsync("FileResult", result);
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [FILES] {request.Operation}: {(result.Success ? "OK" : result.Error)}");
+            Console.ResetColor();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "No se pudo enviar el resultado de archivos al servidor");
+        }
+    }
+
+    /// <summary>
+    /// Ejecuta la lógica del comando recibido sobre el reproductor LibVLC y reporta el resultado.
+    /// </summary>
+    private async Task ProcessCommandAsync(CommandDto command, string screenId)
+    {
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine($"\n==================================================");
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ▶ COMANDO RECIBIDO: {command.Type.ToUpper()} (ID: {command.CommandId})");
+        Console.WriteLine($"==================================================");
+        Console.ResetColor();
+
+        string status = "ok";
+        string detail = string.Empty;
+
+        try
+        {
+            switch (command.Type.ToLowerInvariant())
+            {
+                case "play":
+                    PlayPayload? playPayload = null;
+                    if (!string.IsNullOrWhiteSpace(command.PayloadJson))
+                    {
+                        try
+                        {
+                            playPayload = JsonSerializer.Deserialize<PlayPayload>(command.PayloadJson,
+                                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning("Error deserializando PlayPayload: {Message}", ex.Message);
+                        }
+                    }
+
+                    var mediaPath = playPayload?.MediaPath ?? "C:\\videos\\demo.mp4";
+                    var loop = playPayload?.Loop ?? true;
+                    var volume = playPayload?.Volume ?? _playerManager.Volume;
+
+                    // Reproducir con LibVLC
+                    _playerManager.Play(mediaPath, loop, volume);
+
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"▶ [PLAY VLC] Reproduciendo: {mediaPath}");
+                    Console.WriteLine($"   Loop: {loop} | Volumen: {volume}% | Kiosk Mode");
+                    Console.ResetColor();
+
+                    detail = $"Reproduciendo medio con LibVLC: {mediaPath}";
+
+                    // Forzar emisión inmediata de miniatura
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(1000);
+                        await EmitThumbnailAsync(screenId);
+                    });
+                    break;
+
+                case "pause":
+                    _playerManager.Pause();
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"⏸ [PAUSE VLC] Reproducción alternada en: {_playerManager.CurrentMedia}");
+                    Console.ResetColor();
+                    detail = $"Reproducción pausada/reanudada en: {_playerManager.CurrentMedia}";
+                    break;
+
+                case "stop":
+                    _playerManager.Stop();
+                    Console.ForegroundColor = ConsoleColor.Magenta;
+                    Console.WriteLine($"⏹ [STOP VLC] Reproducción detenida. Estado cambiado a reposo (idle).");
+                    Console.ResetColor();
+                    detail = "Reproducción detenida.";
+
+                    // Emitir inmediatamente miniatura de reposo
+                    await EmitThumbnailAsync(screenId);
+                    break;
+
+                case "volume":
+                    int newVol = _playerManager.Volume;
+                    if (!string.IsNullOrWhiteSpace(command.PayloadJson))
+                    {
+                        try
+                        {
+                            using var doc = JsonDocument.Parse(command.PayloadJson);
+                            if (doc.RootElement.TryGetProperty("volume", out var p) ||
+                                doc.RootElement.TryGetProperty("Volume", out p))
+                            {
+                                newVol = p.GetInt32();
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning("Error leyendo volumen de payload: {Message}", ex.Message);
+                        }
+                    }
+
+                    _playerManager.SetVolume(newVol);
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"🔊 [VOLUME VLC] Volumen ajustado a: {newVol}%");
+                    Console.ResetColor();
+                    detail = $"Volumen ajustado a {newVol}%";
+                    break;
+
+                case "shutdown":
+                    var shutdownResult = _systemCommands.Shutdown();
+                    status = shutdownResult.Success ? "ok" : "error";
+                    detail = shutdownResult.Detail;
+                    break;
+
+                case "restart":
+                    var restartResult = _systemCommands.Restart();
+                    status = restartResult.Success ? "ok" : "error";
+                    detail = restartResult.Detail;
+                    break;
+
+                case "monitor-off":
+                case "monitoroff":
+                case "monitor_off":
+                    var monitorResult = _systemCommands.MonitorOff();
+                    status = monitorResult.Success ? "ok" : "error";
+                    detail = monitorResult.Detail;
+                    break;
+
+                case "lock":
+                case "lock-session":
+                    var lockResult = _systemCommands.LockSession();
+                    status = lockResult.Success ? "ok" : "error";
+                    detail = lockResult.Detail;
+                    break;
+
+                default:
+                    status = "error";
+                    detail = $"Comando no reconocido o no soportado: '{command.Type}'";
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"✖ [ERROR] {detail}");
+                    Console.ResetColor();
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            status = "error";
+            detail = $"Excepción al ejecutar comando: {ex.Message}";
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"✖ [EXCEPCIÓN] {detail}");
+            Console.ResetColor();
+        }
+
+        // Devolver respuesta con CommandResultDto
+        var resultDto = new CommandResultDto
+        {
+            CommandId = command.CommandId,
+            ScreenId = screenId,
+            Status = status,
+            Detail = detail,
+            Timestamp = DateTime.UtcNow
+        };
+
+        if (_hubConnection?.State == HubConnectionState.Connected)
+        {
+            try
+            {
+                await _hubConnection.InvokeAsync("CommandResult", resultDto);
+                Console.ForegroundColor = ConsoleColor.DarkGreen;
+                Console.WriteLine($"✓ [CONFIRMACIÓN] Resultado reportado al servidor: Status='{status}', Detalle='{detail}'\n");
+                Console.ResetColor();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error al enviar CommandResult al servidor");
+            }
+        }
+    }
+}

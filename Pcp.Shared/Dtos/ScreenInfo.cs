@@ -1,0 +1,46 @@
+namespace Pcp.Shared.Dtos;
+
+/// <summary>
+/// Representa el estado actual y métricas de una pantalla (mini-PC stick).
+/// </summary>
+public class ScreenInfo
+{
+    /// <summary>Identificador único de la pantalla (ej. "screen-01").</summary>
+    public string Id { get; set; } = string.Empty;
+
+    /// <summary>Nombre descriptivo de la pantalla.</summary>
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Grupo al que pertenece la pantalla, si tiene uno asignado.</summary>
+    public Guid? GroupId { get; set; }
+
+    /// <summary>Nombre del grupo al que pertenece la pantalla.</summary>
+    public string? GroupName { get; set; }
+
+    /// <summary>Estado de conexión: "online" u "offline".</summary>
+    public string Status { get; set; } = "offline";
+
+    /// <summary>Fecha y hora UTC del último heartbeat recibido.</summary>
+    public DateTime LastHeartbeat { get; set; }
+
+    /// <summary>Ruta o identificador del medio en reproducción actual ("idle" si ninguno).</summary>
+    public string CurrentMedia { get; set; } = "idle";
+
+    /// <summary>Nivel de volumen actual (0-100).</summary>
+    public int Volume { get; set; } = 80;
+
+    /// <summary>Porcentaje estimado de uso de CPU.</summary>
+    public double CpuPercent { get; set; }
+
+    /// <summary>Porcentaje estimado de uso de memoria RAM.</summary>
+    public double RamPercent { get; set; }
+
+    /// <summary>Espacio disponible en disco en Megabytes.</summary>
+    public long FreeDiskMb { get; set; }
+
+    /// <summary>Último fotograma/miniatura en Base64 para verificación visual.</summary>
+    public string? ThumbnailBase64 { get; set; }
+
+    /// <summary>Indica si la pantalla puede abrir una sesión de control remoto (VNC).</summary>
+    public bool RemoteControlAvailable { get; set; }
+}

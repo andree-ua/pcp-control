@@ -1,0 +1,25 @@
+# Dependencias de Node
+node_modules/
+Pcp.Web/node_modules/
+
+# Compilados de .NET
+bin/
+obj/
+Publish/
+
+# Next.js
+.next/
+Pcp.Web/.next/
+Pcp.Web/out/
+
+# Configuraciones locales de VS Code
+.vscode/
+
+# Base de datos local
+*.db
+pcp.db
+
+# Archivos de entorno (Secretos)
+.env
+.env.local
+.env.production
