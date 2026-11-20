@@ -65,6 +65,8 @@ builder.Services.AddSingleton<IFileRequestManager, FileRequestManager>();
 builder.Services.AddSingleton<IVncSessionManager, VncSessionManager>();
 builder.Services.AddScoped<ScreenCommandService>();
 builder.Services.AddScoped<WakeOnLanService>();
+builder.Services.AddScoped<SyncPlayService>();
+builder.Services.AddScoped<PlaylistPlaybackService>();
 builder.Services.AddSingleton<TokenService>();
 builder.Services.AddSignalR(options =>
 {
@@ -215,6 +217,9 @@ builder.Services.AddSwaggerGen(options =>
 
 // Tarea en segundo plano para auditoría de timeout de pantallas (offline detection)
 builder.Services.AddHostedService<OfflineCheckerService>();
+
+// Programador de playlists (Bloque 4): lanza horarios recurrentes.
+builder.Services.AddHostedService<PlaylistSchedulerService>();
 
 // ═══ 3. Configuración de CORS y proxy ═══════════════════════════════════════
 // Los orígenes permitidos se configuran con Cors:AllowedOrigins (en producción)

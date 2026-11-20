@@ -61,11 +61,129 @@ namespace Pcp.Server.Data.Migrations
                     b.ToTable("Commands");
                 });
 
+            modelBuilder.Entity("Pcp.Server.Models.Playlist", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("char(36)");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("datetime(6)");
+
+                    b.Property<bool>("Loop")
+                        .HasColumnType("tinyint(1)");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("varchar(100)");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("datetime(6)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Playlists");
+                });
+
+            modelBuilder.Entity("Pcp.Server.Models.PlaylistItem", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("char(36)");
+
+                    b.Property<int>("DurationSeconds")
+                        .HasColumnType("int");
+
+                    b.Property<string>("MediaPath")
+                        .IsRequired()
+                        .HasMaxLength(500)
+                        .HasColumnType("varchar(500)");
+
+                    b.Property<Guid>("PlaylistId")
+                        .HasColumnType("char(36)");
+
+                    b.Property<int>("Position")
+                        .HasColumnType("int");
+
+                    b.Property<int>("Volume")
+                        .HasColumnType("int");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("PlaylistId", "Position");
+
+                    b.ToTable("PlaylistItems");
+                });
+
+            modelBuilder.Entity("Pcp.Server.Models.Schedule", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("char(36)");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("datetime(6)");
+
+                    b.Property<string>("DaysOfWeek")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("varchar(20)");
+
+                    b.Property<int>("DurationMinutes")
+                        .HasColumnType("int");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("tinyint(1)");
+
+                    b.Property<Guid?>("GroupId")
+                        .HasColumnType("char(36)");
+
+                    b.Property<DateTime?>("LastTriggeredAt")
+                        .HasColumnType("datetime(6)");
+
+                    b.Property<string>("LastTriggeredSlot")
+                        .HasMaxLength(32)
+                        .HasColumnType("varchar(32)");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("varchar(100)");
+
+                    b.Property<Guid>("PlaylistId")
+                        .HasColumnType("char(36)");
+
+                    b.Property<string>("ScreenId")
+                        .HasMaxLength(50)
+                        .HasColumnType("varchar(50)");
+
+                    b.Property<string>("StartTime")
+                        .IsRequired()
+                        .HasMaxLength(5)
+                        .HasColumnType("varchar(5)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Enabled");
+
+                    b.HasIndex("GroupId");
+
+                    b.HasIndex("PlaylistId");
+
+                    b.HasIndex("ScreenId");
+
+                    b.ToTable("Schedules");
+                });
+
             modelBuilder.Entity("Pcp.Server.Models.Screen", b =>
                 {
                     b.Property<string>("Id")
                         .HasMaxLength(50)
                         .HasColumnType("varchar(50)");
+
+                    b.Property<int?>("ClockOffsetMs")
+                        .HasColumnType("int");
 
                     b.Property<double>("CpuPercent")
                         .HasColumnType("double");
@@ -204,6 +322,42 @@ namespace Pcp.Server.Data.Migrations
                     b.ToTable("Users");
                 });
 
+            modelBuilder.Entity("Pcp.Server.Models.PlaylistItem", b =>
+                {
+                    b.HasOne("Pcp.Server.Models.Playlist", "Playlist")
+                        .WithMany("Items")
+                        .HasForeignKey("PlaylistId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Playlist");
+                });
+
+            modelBuilder.Entity("Pcp.Server.Models.Schedule", b =>
+                {
+                    b.HasOne("Pcp.Server.Models.ScreenGroup", "Group")
+                        .WithMany()
+                        .HasForeignKey("GroupId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.HasOne("Pcp.Server.Models.Playlist", "Playlist")
+                        .WithMany("Schedules")
+                        .HasForeignKey("PlaylistId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("Pcp.Server.Models.Screen", "Screen")
+                        .WithMany()
+                        .HasForeignKey("ScreenId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.Navigation("Group");
+
+                    b.Navigation("Playlist");
+
+                    b.Navigation("Screen");
+                });
+
             modelBuilder.Entity("Pcp.Server.Models.Screen", b =>
                 {
                     b.HasOne("Pcp.Server.Models.ScreenGroup", "Group")
@@ -212,6 +366,13 @@ namespace Pcp.Server.Data.Migrations
                         .OnDelete(DeleteBehavior.SetNull);
 
                     b.Navigation("Group");
+                });
+
+            modelBuilder.Entity("Pcp.Server.Models.Playlist", b =>
+                {
+                    b.Navigation("Items");
+
+                    b.Navigation("Schedules");
                 });
 
             modelBuilder.Entity("Pcp.Server.Models.ScreenGroup", b =>

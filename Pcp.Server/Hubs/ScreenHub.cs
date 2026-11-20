@@ -197,6 +197,13 @@ public class ScreenHub : Hub
             screen.IsWired = dto.IsWired.Value;
         }
 
+        // Desfase de reloj medido por el agente contra /api/time (Bloque 3).
+        // Los agentes antiguos no lo envían: se conserva el último valor conocido.
+        if (dto.ClockOffsetMs.HasValue)
+        {
+            screen.ClockOffsetMs = dto.ClockOffsetMs.Value;
+        }
+
         await _db.SaveChangesAsync();
 
         _remoteControlAvailable[screen.Id] = dto.RemoteControlAvailable;
@@ -226,6 +233,8 @@ public class ScreenHub : Hub
             LastConnectionAt = screen.LastConnectionAt,
             WolEnabled = screen.WolEnabled,
             IsWired = screen.IsWired,
+            ClockOffsetMs = screen.ClockOffsetMs,
+            ClockSynced = dto.ClockSynced,
             ThumbnailBase64 = GetLatestThumbnail(screen.Id),
             RemoteControlAvailable = dto.RemoteControlAvailable
         };

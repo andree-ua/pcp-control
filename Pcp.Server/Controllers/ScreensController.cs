@@ -21,17 +21,20 @@ public class ScreensController : ControllerBase
     private readonly AppDbContext _db;
     private readonly ScreenCommandService _commands;
     private readonly WakeOnLanService _wake;
+    private readonly SyncPlayService _syncPlay;
     private readonly ILogger<ScreensController> _logger;
 
     public ScreensController(
         AppDbContext db,
         ScreenCommandService commands,
         WakeOnLanService wake,
+        SyncPlayService syncPlay,
         ILogger<ScreensController> logger)
     {
         _db = db;
         _commands = commands;
         _wake = wake;
+        _syncPlay = syncPlay;
         _logger = logger;
     }
 
@@ -62,7 +65,9 @@ public class ScreensController : ControllerBase
                 LocalIp = s.LocalIp,
                 LastConnectionAt = s.LastConnectionAt,
                 WolEnabled = s.WolEnabled,
-                IsWired = s.IsWired
+                IsWired = s.IsWired,
+                ClockOffsetMs = s.ClockOffsetMs,
+                ClockSynced = s.ClockOffsetMs != null
             })
             .ToListAsync();
 
@@ -111,6 +116,8 @@ public class ScreensController : ControllerBase
             LastConnectionAt = s.LastConnectionAt,
             WolEnabled = s.WolEnabled,
             IsWired = s.IsWired,
+            ClockOffsetMs = s.ClockOffsetMs,
+            ClockSynced = s.ClockOffsetMs != null,
             ThumbnailBase64 = ScreenHub.GetLatestThumbnail(s.Id),
             RemoteControlAvailable = ScreenHub.GetRemoteControlAvailable(s.Id)
         });
@@ -270,6 +277,32 @@ public class ScreensController : ControllerBase
                 "cooldown" => StatusCode(
                     StatusCodes.Status429TooManyRequests,
                     new { error = result.Error, retryAfterSeconds = result.RetryAfterSeconds }),
+                _ => BadRequest(new { error = result.Error })
+            };
+        }
+
+        return Ok(result.Response);
+    }
+
+    /// <summary>
+    /// POST /api/screens/sync/play
+    /// Programa la reproducción del mismo medio a la vez en varias pantallas
+    /// (o en todas las de un grupo). El instante de arranque se fija en el reloj
+    /// del servidor; cada agente lo traduce a su reloj local con el offset de /api/time.
+    /// </summary>
+    [HttpPost("sync/play")]
+    [Authorize(Roles = TokenService.AdminRole)]
+    public async Task<IActionResult> SyncPlay(
+        [FromBody] SyncPlayRequestDto request,
+        CancellationToken cancellationToken)
+    {
+        var result = await _syncPlay.DispatchAsync(request, cancellationToken);
+
+        if (!result.Success)
+        {
+            return result.ErrorCode switch
+            {
+                "not-found" => NotFound(new { error = result.Error }),
                 _ => BadRequest(new { error = result.Error })
             };
         }

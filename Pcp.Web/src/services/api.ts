@@ -1,6 +1,13 @@
-import { CommandRequest, CommandResponse, RemoteSession, ScreenInfo, WakeResponse } from "@/types/screen";
+import { CommandRequest, CommandResponse, RemoteSession, ScreenInfo, SyncPlayRequest, SyncPlayResponse, WakeResponse } from "@/types/screen";
 import { FileListing, FileOperationResponse } from "@/types/files";
 import { GroupCommandResponse, GroupInfo, GroupUpsert } from "@/types/group";
+import {
+  Playlist,
+  PlaylistPlayRequest,
+  PlaylistPlayResponse,
+  PlaylistUpsert,
+} from "@/types/playlist";
+import { Schedule, ScheduleUpsert } from "@/types/schedule";
 
 // NEXT_PUBLIC_* se inyecta en tiempo de build (Next.js la incrusta en el bundle).
 // En producción se define en Pcp.Web/.env.production o en el panel de la nube.
@@ -102,6 +109,32 @@ export async function wakeScreen(screenId: string, relayScreenId?: string): Prom
   }
 
   return data as WakeResponse;
+}
+
+/**
+ * Programa la reproducción del mismo medio a la vez en varias pantallas.
+ * El servidor fija el instante de arranque en su propio reloj; cada agente lo
+ * traduce al suyo con el offset medido contra /api/time.
+ */
+export async function syncPlay(request: SyncPlayRequest): Promise<SyncPlayResponse> {
+  const response = await apiFetch(`${SERVER_URL}/api/screens/sync/play`, {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+  });
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(
+      data?.error || `No se pudo programar la reproducción sincronizada (HTTP ${response.status})`
+    );
+  }
+
+  return data as SyncPlayResponse;
 }
 
 export async function fetchFiles(screenId: string, path?: string): Promise<FileListing> {
@@ -349,11 +382,186 @@ export async function sendGroupCommand(
   return data as GroupCommandResponse;
 }
 
+// ── Playlists (Bloque 4) ───────────────────────────────────────────────────
+
+export async function fetchPlaylists(): Promise<Playlist[]> {
+  const response = await apiFetch(`${SERVER_URL}/api/playlists`, {
+    cache: "no-store",
+    credentials: "include",
+  });
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(data?.error || `No se pudieron cargar las playlists (HTTP ${response.status})`);
+  }
+
+  return data as Playlist[];
+}
+
+export async function createPlaylist(payload: PlaylistUpsert): Promise<Playlist> {
+  return savePlaylistRequest(`${SERVER_URL}/api/playlists`, "POST", payload);
+}
+
+export async function updatePlaylist(id: string, payload: PlaylistUpsert): Promise<Playlist> {
+  return savePlaylistRequest(
+    `${SERVER_URL}/api/playlists/${encodeURIComponent(id)}`,
+    "PUT",
+    payload
+  );
+}
+
+async function savePlaylistRequest(
+  url: string,
+  method: "POST" | "PUT",
+  payload: PlaylistUpsert
+): Promise<Playlist> {
+  const response = await apiFetch(url, {
+    method,
+    credentials: "include",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(data?.error || `No se pudo guardar la playlist (HTTP ${response.status})`);
+  }
+
+  return data as Playlist;
+}
+
+export async function deletePlaylist(id: string): Promise<void> {
+  const response = await apiFetch(`${SERVER_URL}/api/playlists/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => null);
+    throw new Error(data?.error || `No se pudo eliminar la playlist (HTTP ${response.status})`);
+  }
+}
+
+/**
+ * Lanza una playlist ahora en una pantalla o en un grupo. El servidor fija el
+ * instante de arranque en su reloj y los agentes lo traducen al suyo.
+ */
+export async function playPlaylist(
+  id: string,
+  request: PlaylistPlayRequest
+): Promise<PlaylistPlayResponse> {
+  const response = await apiFetch(
+    `${SERVER_URL}/api/playlists/${encodeURIComponent(id)}/play`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(request),
+    }
+  );
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(data?.error || `No se pudo reproducir la playlist (HTTP ${response.status})`);
+  }
+
+  return data as PlaylistPlayResponse;
+}
+
+// ── Horarios (Bloque 4) ────────────────────────────────────────────────────
+
+export async function fetchSchedules(): Promise<Schedule[]> {
+  const response = await apiFetch(`${SERVER_URL}/api/schedules`, {
+    cache: "no-store",
+    credentials: "include",
+  });
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(data?.error || `No se pudieron cargar los horarios (HTTP ${response.status})`);
+  }
+
+  return data as Schedule[];
+}
+
+export async function createSchedule(payload: ScheduleUpsert): Promise<Schedule> {
+  return saveScheduleRequest(`${SERVER_URL}/api/schedules`, "POST", payload);
+}
+
+export async function updateSchedule(id: string, payload: ScheduleUpsert): Promise<Schedule> {
+  return saveScheduleRequest(
+    `${SERVER_URL}/api/schedules/${encodeURIComponent(id)}`,
+    "PUT",
+    payload
+  );
+}
+
+async function saveScheduleRequest(
+  url: string,
+  method: "POST" | "PUT",
+  payload: ScheduleUpsert
+): Promise<Schedule> {
+  const response = await apiFetch(url, {
+    method,
+    credentials: "include",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(data?.error || `No se pudo guardar el horario (HTTP ${response.status})`);
+  }
+
+  return data as Schedule;
+}
+
+export async function deleteSchedule(id: string): Promise<void> {
+  const response = await apiFetch(`${SERVER_URL}/api/schedules/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => null);
+    throw new Error(data?.error || `No se pudo eliminar el horario (HTTP ${response.status})`);
+  }
+}
+
+/** Ejecuta un horario ahora mismo (prueba manual con el mismo camino que el programador). */
+export async function runSchedule(id: string): Promise<PlaylistPlayResponse> {
+  const response = await apiFetch(
+    `${SERVER_URL}/api/schedules/${encodeURIComponent(id)}/run`,
+    {
+      method: "POST",
+      credentials: "include",
+    }
+  );
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(data?.error || `No se pudo ejecutar el horario (HTTP ${response.status})`);
+  }
+
+  return data as PlaylistPlayResponse;
+}
+
 /**
  * Abre una sesión de escritorio remoto en el servidor.
  * El servidor prepara el túnel VNC del agente y devuelve la URL WebSocket para noVNC.
- */
-export async function startRemoteSession(
+ */export async function startRemoteSession(
   screenId: string,
   viewOnly = false
 ): Promise<RemoteSession> {

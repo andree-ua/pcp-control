@@ -25,6 +25,15 @@ public class AppDbContext : DbContext
     /// <summary>Usuarios del panel con sus roles (Fase 3).</summary>
     public DbSet<User> Users => Set<User>();
 
+    /// <summary>Playlists de reproducción ordenada (Bloque 4).</summary>
+    public DbSet<Playlist> Playlists => Set<Playlist>();
+
+    /// <summary>Elementos de las playlists.</summary>
+    public DbSet<PlaylistItem> PlaylistItems => Set<PlaylistItem>();
+
+    /// <summary>Horarios recurrentes que lanzan playlists.</summary>
+    public DbSet<Schedule> Schedules => Set<Schedule>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
@@ -77,6 +86,55 @@ public class AppDbContext : DbContext
             entity.Property(u => u.PasswordHash).HasMaxLength(256).IsRequired();
             entity.Property(u => u.Role).HasMaxLength(20).IsRequired();
             entity.HasIndex(u => u.Username).IsUnique();
+        });
+
+        // ── Bloque 4: playlists y programación ─────────────────────────────
+        modelBuilder.Entity<Playlist>(entity =>
+        {
+            entity.HasKey(p => p.Id);
+            entity.Property(p => p.Name).HasMaxLength(100).IsRequired();
+
+            // Los elementos viven y mueren con la playlist.
+            entity.HasMany(p => p.Items)
+                  .WithOne(i => i.Playlist)
+                  .HasForeignKey(i => i.PlaylistId)
+                  .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<PlaylistItem>(entity =>
+        {
+            entity.HasKey(i => i.Id);
+            entity.Property(i => i.MediaPath).HasMaxLength(500).IsRequired();
+            // El panel siempre lee los elementos de una playlist ordenados.
+            entity.HasIndex(i => new { i.PlaylistId, i.Position });
+        });
+
+        modelBuilder.Entity<Schedule>(entity =>
+        {
+            entity.HasKey(s => s.Id);
+            entity.Property(s => s.Name).HasMaxLength(100).IsRequired();
+            entity.Property(s => s.ScreenId).HasMaxLength(50);
+            entity.Property(s => s.DaysOfWeek).HasMaxLength(20).IsRequired();
+            entity.Property(s => s.StartTime).HasMaxLength(5).IsRequired();
+            entity.Property(s => s.LastTriggeredSlot).HasMaxLength(32);
+            entity.HasIndex(s => s.Enabled);
+
+            // Borrar una playlist elimina sus horarios; borrar pantalla/grupo
+            // solo deja el horario sin destino (se valida al editarlo).
+            entity.HasOne(s => s.Playlist)
+                  .WithMany(p => p.Schedules)
+                  .HasForeignKey(s => s.PlaylistId)
+                  .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasOne(s => s.Screen)
+                  .WithMany()
+                  .HasForeignKey(s => s.ScreenId)
+                  .OnDelete(DeleteBehavior.SetNull);
+
+            entity.HasOne(s => s.Group)
+                  .WithMany()
+                  .HasForeignKey(s => s.GroupId)
+                  .OnDelete(DeleteBehavior.SetNull);
         });
     }
 }

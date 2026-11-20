@@ -58,4 +58,13 @@ public class ScreenInfo
 
     /// <summary>Indica si la interfaz activa es cableada. Null si el agente no lo informó.</summary>
     public bool? IsWired { get; set; }
+
+    /// <summary>
+    /// Desfase del reloj del agente respecto al servidor en milisegundos.
+    /// Null si el agente aún no sincronizó (agente antiguo o /api/time inaccesible).
+    /// </summary>
+    public int? ClockOffsetMs { get; set; }
+
+    /// <summary>Indica si el agente tiene referencia de hora del servidor (sincronización lista).</summary>
+    public bool ClockSynced { get; set; }
 }

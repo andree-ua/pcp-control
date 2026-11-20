@@ -1,6 +1,6 @@
 "use client";
 
-import { RefreshCw, Monitor, Radio, Users, LogOut, ShieldCheck, Eye } from "lucide-react";
+import { RefreshCw, Monitor, Radio, Users, LogOut, ShieldCheck, Eye, ListVideo } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
@@ -56,6 +56,17 @@ export function Header({ connectionStatus, onRefresh, isLoading }: HeaderProps) 
           >
             <Users className="w-3.5 h-3.5" />
             Grupos
+          </Link>
+          <Link
+            href="/playlists"
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+              pathname === "/playlists"
+                ? "bg-zinc-800 text-white"
+                : "text-zinc-400 hover:text-zinc-200"
+            }`}
+          >
+            <ListVideo className="w-3.5 h-3.5" />
+            Playlists
           </Link>
         </nav>
 

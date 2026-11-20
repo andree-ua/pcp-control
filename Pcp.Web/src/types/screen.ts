@@ -17,6 +17,41 @@ export interface ScreenInfo {
   lastConnectionAt?: string | null;
   wolEnabled?: boolean;
   isWired?: boolean | null;
+  /** Desfase del reloj del agente respecto al servidor (ms). Null si aún no sincronizó. */
+  clockOffsetMs?: number | null;
+  /** Indica si el agente ya tiene referencia de hora del servidor. */
+  clockSynced?: boolean;
+}
+
+/** Petición de reproducción sincronizada (mismo medio en varias pantallas a la vez). */
+export interface SyncPlayRequest {
+  screenIds?: string[];
+  groupId?: string | null;
+  mediaPath: string;
+  loop?: boolean;
+  volume?: number;
+  fitMode?: string;
+  /** Margen de seguridad en segundos antes del arranque (3-120). */
+  startInSeconds?: number;
+}
+
+export interface SyncPlayResultItem {
+  screenId: string;
+  success: boolean;
+  commandId?: string | null;
+  error?: string | null;
+}
+
+export interface SyncPlayResponse {
+  syncToken: string;
+  startAtUnixMs: number;
+  startAtUtc: string;
+  startInSeconds: number;
+  total: number;
+  sent: number;
+  offline: number;
+  failed: number;
+  results: SyncPlayResultItem[];
 }
 
 /**

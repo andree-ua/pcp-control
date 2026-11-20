@@ -50,4 +50,15 @@ public class HeartbeatDto
 
     /// <summary>Indica si la interfaz activa es cableada (Ethernet) o inalámbrica (Wi-Fi).</summary>
     public bool? IsWired { get; set; }
+
+    // ── Sincronización de reloj (Bloque 3) ─────────────────────────────────
+
+    /// <summary>
+    /// Desfase calculado entre el reloj del agente y el del servidor, en milisegundos
+    /// (servidor - agente). Null si el agente todavía no sincronizó contra /api/time.
+    /// </summary>
+    public int? ClockOffsetMs { get; set; }
+
+    /// <summary>Indica si el agente tiene una referencia de hora del servidor.</summary>
+    public bool ClockSynced { get; set; }
 }

@@ -1,7 +1,7 @@
 # AGENTS.md — PCP (Panel de Control de Pantallas)
 
 Mapa de arquitectura y reglas de negocio del proyecto. **Léelo antes de tocar código.**
-Última actualización: 2026-11-20 (Fase 0–3 completas + Bloque 1 de Fase 3: JWT, roles y login del panel + Bloque 2: Wake-on-LAN operativo con relay entre agentes).
+Última actualización: 2026-11-20 (Fase 0–3 completas + Bloque 1: JWT, roles y login del panel + Bloque 2: Wake-on-LAN operativo con relay entre agentes y encendido masivo por grupo + Bloque 3: sincronización de reproducción con reloj del servidor + Bloque 4: playlists y programación de horarios).
 
 ---
 
@@ -45,6 +45,9 @@ C:\Proyectos\Pcp\
 │     ├─ RegisterDto.cs       ← pre-registro REST del agente
 │     ├─ FileDtos.cs          ← contratos del explorador de archivos (list/delete/upload)
 │     ├─ GroupDtos.cs         ← grupos y respuestas de comandos masivos
+│     ├─ WolDtos.cs           ← payload/resultado de Wake-on-LAN
+│     ├─ TimeDtos.cs          ← hora del servidor y reproducción sincronizada
+│     ├─ PlaylistDtos.cs      ← playlists, reproducción y horarios (Bloque 4)
 │     └─ RemoteControlDtos.cs ← sesiones VNC (petición de túnel, estado, respuesta REST)
 ├─ scripts\publish-agent.ps1  ← publish single-file + ZIP de despliegue
 ├─ deploy\                    ← instalador zero-touch para los sticks
@@ -69,8 +72,15 @@ C:\Proyectos\Pcp\
 │  ├─ Services\FileRequestManager.cs  ← correlación requestId ↔ respuesta del agente
 │  ├─ Services\ScreenCommandService.cs ← envío/persistencia de comandos compartido
 │  ├─ Services\WakeOnLanService.cs    ← relay de Magic Packets y envío directo opcional
+│  ├─ Services\SyncPlayService.cs     ← reproducción sincronizada (instante del servidor)
+│  ├─ Services\PlaylistPlaybackService.cs  ← lanza playlists en pantalla/grupo
+│  ├─ Services\PlaylistSchedulerService.cs ← programador de horarios (hosted service)
+│  ├─ Services\ScheduleTime.cs        ← días ISO, "HH:mm" y zona horaria
 │  ├─ Services\NetworkData.cs         ← normalización de MAC/IP/CIDR y broadcast dirigido
 │  ├─ Services\VncSessionManager.cs   ← sesiones VNC y puente WS panel ↔ agente
+│  ├─ Controllers\TimeController.cs   ← GET /api/time (referencia de reloj para los agentes)
+│  ├─ Controllers\PlaylistsController.cs  ← CRUD de playlists y reproducción
+│  ├─ Controllers\SchedulesController.cs  ← CRUD de horarios y ejecución manual
 │  ├─ Controllers\RemoteControlController.cs ← start/stop del escritorio remoto
 │  ├─ appsettings.json        ← SQLite de desarrollo (fallback)
 │  ├─ appsettings.Production.json ← proveedor MySQL y CORS por entorno
@@ -86,20 +96,25 @@ C:\Proyectos\Pcp\
 │  ├─ Services\VncRemoteControlService.cs ← túnel WebSocket saliente hacia el servidor
 │  ├─ Services\NetworkInfoProvider.cs ← detecta MAC/IP/máscara/CIDR de la NIC física (WOL)
 │  ├─ Services\WakeOnLanSender.cs     ← emite Magic Packets por encargo del servidor (relay)
-│  ├─ Services\VlcPlayerManager.cs    ← ventana kiosco + LibVLC + captura
+│  ├─ Services\ServerClock.cs         ← offset de reloj contra /api/time (Bloque 3)
+│  ├─ Services\VlcPlayerManager.cs    ← ventana kiosco + LibVLC + captura + PlaySynchronized + playlists
 │  └─ appsettings.json        ← opcional; las variables PCP_* tienen prioridad
 └─ Pcp.Web\                   ← Next.js 14 App Router + Tailwind + SignalR client
    ├─ src\app\page.tsx        ← dashboard de pantallas
    ├─ src\app\groups\page.tsx ← sección de grupos y control masivo
+   ├─ src\app\playlists\page.tsx ← playlists y programación de horarios (Bloque 4)
    ├─ src\app\layout.tsx      ← layout raíz (tema oscuro)
    ├─ src\app\globals.css
    ├─ src\components\         ← Header, SummaryBar, ScreenCard, Toast, FileExplorerModal,
-   │                            GroupCard, SystemActionsMenu, RemoteDesktopModal (noVNC)
+   │                            GroupCard, SystemActionsMenu, RemoteDesktopModal (noVNC),
+   │                            PlaylistEditor, PlaylistCard, ScheduleForm, ScheduleCard
    ├─ src\hooks\useScreensSignalR.ts  ← estado global + conexión SignalR
    ├─ src\services\api.ts     ← fetch REST (URL desde env)
    ├─ src\types\screen.ts     ← tipos TS espejo de los DTOs
    ├─ src\types\files.ts      ← tipos TS del explorador de archivos
    ├─ src\types\group.ts      ← tipos TS de grupos
+   ├─ src\types\playlist.ts   ← tipos TS de playlists
+   ├─ src\types\schedule.ts   ← tipos TS de horarios y etiquetas de días
    ├─ src\types\novnc.d.ts    ← declaraciones mínimas de @novnc/novnc
    ├─ .env / .env.local       ← desarrollo: NEXT_PUBLIC_API_URL=http://localhost:5000
    ├─ .env.production         ← build de producción: dominio real con HTTPS
@@ -132,12 +147,24 @@ C:\Proyectos\Pcp\
 | POST | `/api/screens/register` | Crea pantalla (Name/Token por defecto) o actualiza `Name`. Devuelve `{ screenId, token, isNew }`. Exige `ScreenId`. |
 | POST | `/api/screens/{id}/command` | Valida `type`, busca pantalla y `ConnectionId`; si no está conectada → 400. Persiste `Command` (`pending`), emite `SendCommandToAgent` al ConnectionId, marca `sent`. Devuelve `{ commandId, status, screenId, type }`. |
 | POST | `/api/screens/{id}/wake` | Wake-on-LAN. Solo `Admin`. Valida MAC/IP/cableado y que esté offline; elige un agente online de la misma `NetworkCidr` y le envía el comando `wake` (modo `peer`). Con `Wol:DirectSendEnabled` emite el paquete desde el servidor si no hay relay. Devuelve `{ requested, mode, relayScreenId, macAddress, broadcastAddress, commandId, retryAfterSeconds }`. Errores: 404/400/409 (ya online)/429 (cooldown)/503 (sin relay)/500. |
+| POST | `/api/screens/sync/play` | Reproducción sincronizada. Solo `Admin`. Acepta `{ screenIds[] }` o `{ groupId }`, `mediaPath`, `loop`, `volume`, `fitMode`, `startInSeconds` (3–120, por defecto 8). Fija un `StartAtUnixMs` en el reloj del servidor y envía `sync-play` a cada pantalla con el **mismo** instante. Devuelve `{ syncToken, startAtUnixMs, startAtUtc, startInSeconds, total, sent, offline, failed, results }`. Errores: 404 (grupo/pantallas inexistentes), 400 (sin destino o sin `mediaPath`). |
 
 Reglas del comando:
 - `payload` puede llegar como `JsonElement` o como objeto; se normaliza a `PayloadJson` (string JSON) antes de guardar/enviar.
 - Si la pantalla figura offline pero tiene conexión activa, se corrige a `online`.
 - Si el `SendAsync` falla → `Command.Status = "error"`, `ResultDetail` con la excepción, HTTP 500.
 - `CommandRequest` (clase local del controlador): `Type` obligatorio, `Payload` opcional (`object`).
+
+### REST — hora del servidor (`Controllers/TimeController.cs`)
+
+| Método | Ruta | Comportamiento |
+|---|---|---|
+| GET | `/api/time` | `[AllowAnonymous]`, sin caché. Devuelve `{ unixTimeMs, utcNow, server }` con la hora UTC del servidor. Lo consumen los agentes para medir su desfase de reloj antes de un `sync-play`. |
+
+Reglas de la reproducción sincronizada (Bloque 3):
+- `SyncPlayService` resuelve el destino (el grupo tiene prioridad sobre `screenIds`), limita `startInSeconds` a 3–120 s y envía a cada pantalla el comando `sync-play` con el **mismo** `StartAtUnixMs`; el orden y la latencia de los envíos no afectan a la sincronía.
+- Las pantallas offline se omiten y se cuentan en `offline` (el panel lo muestra en el resumen), igual que en los comandos masivos.
+- Cada agente convierte el instante del servidor a su reloj local con el offset de `ServerClock`; si la orden llega tarde arranca de inmediato y salta al punto correspondiente (`:start-time`).
 
 ### REST — `Controllers/FilesController.cs` (`[Route("api/screens/{screenId}/files")]`)
 
@@ -169,6 +196,39 @@ Reglas de grupos:
 - Las pantallas offline se omiten en comandos masivos y se cuentan en `offline`; no se encolan.
 - `ScreenCommandService` centraliza el envío individual y masivo. La lógica es la misma que `/api/screens/{id}/command`.
 - Las tablas y la FK `Screens.GroupId → ScreenGroups.Id` las crea la migración `InitialCreate` de EF Core (MySQL). No se modifican tablas manualmente.
+
+### REST — `Controllers/PlaylistsController.cs` (`[Route("api/playlists")]`)
+
+| Método | Ruta | Comportamiento |
+|---|---|---|
+| GET | `/api/playlists` | Lista playlists con sus elementos ordenados por `position`. |
+| GET | `/api/playlists/{id}` | Detalle; 404 si no existe. |
+| POST | `/api/playlists` | Crea playlist (`name`, `loop`, `items[]`). Valida nombre ≤100 y rutas ≤500. |
+| PUT | `/api/playlists/{id}` | Renombra y **reemplaza** los elementos por diferencias: reutiliza las filas por posición y añade/borra solo las que sobran o faltan. |
+| DELETE | `/api/playlists/{id}` | Elimina la playlist; sus elementos y sus horarios caen por FK en cascada. |
+| POST | `/api/playlists/{id}/play` | Lanza la playlist ahora en `screenIds[]` o `groupId`, con `startInSeconds` (3–120, 8 por defecto). Devuelve `{ playlistId, name, startAtUnixMs, startAtUtc, total, sent, offline, failed, results }`. |
+
+Reglas de playlists:
+- El panel envía la lista completa en cada guardado; `durationSeconds = 0` significa reproducir hasta el fin natural del vídeo y `volume = 0` usa el volumen por defecto de la playlist.
+- El agente reproduce la lista de forma autónoma (`play-playlist`): el servidor no avanza elementos ni cronometra.
+- `Loop` repite la lista desde el principio al terminar el último elemento.
+
+### REST — `Controllers/SchedulesController.cs` (`[Route("api/schedules")]`)
+
+| Método | Ruta | Comportamiento |
+|---|---|---|
+| GET | `/api/schedules` | Horarios con playlist, destino, zona horaria y `nextRunAt` calculado. |
+| GET | `/api/schedules/{id}` | Detalle. |
+| POST | `/api/schedules` | Crea horario (`playlistId`, `screenId` xor `groupId`, `daysOfWeek[]` ISO 1–7, `startTime` "HH:mm", `durationMinutes`, `enabled`). |
+| PUT | `/api/schedules/{id}` | Actualiza. Si cambia playlist/destino/días/hora se libera el hueco ya ejecutado; pausar o reactivar a mitad de ventana no relanza la playlist. |
+| DELETE | `/api/schedules/{id}` | Elimina el horario. |
+| POST | `/api/schedules/{id}/run` | Ejecuta ahora con el mismo camino que el programador (margen de 8 s). |
+
+Reglas de programación:
+- `Scheduling:TimeZone` (por defecto `Europe/Madrid`) define cómo se interpreta `startTime`; el servidor lo convierte a UTC y envía el instante absoluto (se combina con el reloj del Bloque 3).
+- `PlaylistSchedulerService` revisa cada `Scheduling:TickSeconds` (20 s) y dispara `Scheduling:LeadSeconds` (10 s) antes del inicio. `LastTriggeredSlot` persiste el hueco ejecutado: un reinicio del servidor no relanza la playlist.
+- Ventana de reintento: `durationMinutes` o 30 min si es 0. Si no hay pantallas online se reintenta en cada tick dentro de la ventana; las offline se omiten y se cuentan.
+- Un horario sin destino (pantalla/grupo eliminados) se rechaza al editarlo y el programador lo ignora.
 
 ### REST — `Controllers/RemoteControlController.cs` (`[Route("api/screens/{screenId}/remote")]`)
 
@@ -244,13 +304,19 @@ Reglas de autenticación:
 - `ScreenConnectionManager`: diccionarios `ConcurrentDictionary` bidireccionales `screenId↔connectionId`. Singleton. Solo memoria: se pierde al reiniciar el servidor (los agentes reconectan).
 - `OfflineCheckerService`: cada **10 s** busca pantallas `online` con `LastHeartbeat < UtcNow - 30 s`, las marca `offline`, guarda y emite `ScreenStatusChanged`.
 - `VncSessionManager`: sesiones VNC en memoria (`sessionId`, `screenId`, contraseña RFB, secreto de agente, sockets panel/agente), emparejamiento de los dos WebSockets, bombeo bidireccional y limpieza. Un `Timer` cierra sesiones caducadas cada 10 s. Singleton con `IHubContext<ScreenHub>` para avisar al agente del cierre.
+- `SyncPlayService` (scoped): fija el instante de arranque en el reloj del servidor, construye el `SyncPlayPayload` común y delega el envío en `ScreenCommandService`. Compartido por el endpoint `sync/play` y disponible para futuros comandos masivos sincronizados.
+- `PlaylistPlaybackService` (scoped): valida la playlist (elementos no vacíos), resuelve el destino (grupo o lista de pantallas) y envía un único `play-playlist` con todos los elementos y el instante de arranque. Lo usan el panel y el programador.
+- `PlaylistSchedulerService` (hosted service): cada tick busca horarios activos en su ventana horaria, evita duplicados con `LastTriggeredSlot` y lanza la playlist con el instante exacto del hueco. Respeta `Scheduling:Enabled`.
+- `ScheduleTime` (static): días ISO ↔ "1,2,3", validación de "HH:mm", conversión local ↔ UTC y cálculo de `NextRunUtc`.
 
 ### Persistencia — `AppDbContext`
 - `Screens` (PK `Id` string ≤50; `Name` ≤100; `Token` ≤128; `Status` ≤20; `CurrentMedia` ≤500; resto telemetría). `ThumbnailBase64` está `[NotMapped]`/`Ignore`.
   Bloque 2 (Wake-on-LAN): `MacAddress` ≤17, `LocalIp`/`SubnetMask` ≤45, `NetworkCidr` ≤64 (indexado para emparejar relays), `IsWired` bool nullable (null = agente antiguo), `WolEnabled` bool (default `true`) y `LastConnectionAt` datetime nullable.
+  Bloque 3 (sincronización): `ClockOffsetMs` int nullable = desfase del reloj del agente respecto al servidor (null = aún sin sincronizar).
+  Bloque 4 (playlists y programación): `Playlists` (`Id` Guid, `Name` ≤100, `Loop`, `CreatedAt`, `UpdatedAt`), `PlaylistItems` (`Id` Guid, FK `PlaylistId` en cascada, `Position`, `MediaPath` ≤500, `DurationSeconds`, `Volume`; índice `(PlaylistId, Position)`) y `Schedules` (`Id` Guid, `Name` ≤100, FK `PlaylistId` en cascada, `ScreenId`/`GroupId` con `SetNull`, `DaysOfWeek` ≤20, `StartTime` ≤5, `DurationMinutes`, `Enabled` indexado, `LastTriggeredSlot` ≤32, `LastTriggeredAt`).
 - `Commands` (PK `Guid`; `ScreenId` ≤50; `Type` ≤50; `Status` ≤20; `PayloadJson`, `ExecutedAt?`, `ResultDetail` ≤1000).
 - FK `Screens.GroupId → ScreenGroups.Id` con `OnDelete(SetNull)` e índice `IX_Screens_GroupId`.
-- Migración `Data/Migrations/*_InitialCreate.cs` específica de MySQL (`char(36)`, `datetime(6)`, `utf8mb4`, `longtext`). El snapshot se usa con `dotnet ef`; SQLite de desarrollo sigue con `EnsureCreated`.
+- Migraciones `Data/Migrations/*` (`InitialCreate`, `AddAuthUsers`, `AddWakeOnLan`, `AddClockSync`, `AddPlaylistsScheduling`) específicas de MySQL (`char(36)`, `datetime(6)`, `utf8mb4`, `longtext`). El snapshot se usa con `dotnet ef`; SQLite de desarrollo sigue con `EnsureCreated`.
 
 ---
 
@@ -260,6 +326,7 @@ Reglas de autenticación:
 0. `Program.cs` (WinExe, sin consola) inicializa `AgentLog` en `C:\ProgramData\PcpAgent\agent.log`, redirige `Console.*` al archivo, registra solo el proveedor de archivo para `ILogger` y toma el mutex `Local\PcpAgent-{screenId}` (segunda instancia → termina).
 1. Lee config `Agent:*` (defaults: `screen-01`, `Pantalla screen-01`, `dev-token`, `http://localhost:5000`) desde `appsettings.json` junto al `.exe` (opcional), variables estándar (`Agent__ServerUrl`), prefijo `PCP_` (`PCP_Agent__ServerUrl`) o atajos `PCP_SERVER_URL` / `PCP_SCREEN_ID` / `PCP_SCREEN_NAME` / `PCP_TOKEN`.
 2. `POST /api/screens/register` hasta 3 intentos (timeout 5 s); si falla, continúa. Envía también MAC/IP/máscara/CIDR/`IsWired` de la NIC física detectada por `NetworkInfoProvider`.
+2b. `ServerClock.SyncAsync()` mide el offset contra `GET /api/time` (5 muestras, se queda con la de menor RTT). El offset se revalida cada **5 min** y en cada reconexión; viaja en el heartbeat como `ClockOffsetMs`/`ClockSynced`.
 3. Construye URL del Hub con `screenId` y `token` en query y `WithAutomaticReconnect` (0, 2, 5, 10, 20 s).
 4. `ConnectWithRetryAsync`: reintenta cada 3 s hasta conectar.
 5. Tarea independiente de miniaturas cada **5 s** (más una inmediata al conectar).
@@ -324,6 +391,8 @@ Reglas de autenticación:
 | `volume` | Lee `volume`/`Volume` del JSON (case-insensitive vía TryGetProperty de ambas variantes) y aplica clamp 0–100. | Volumen ajustado |
 | `kiosk-pause` / `kiosk-resume` | Alias `pausekiosk`, `kiosk_pause`, `pause_kiosk` y `resumekiosk`, `kiosk_resume`, `resume_kiosk`. Suspende o reanuda el kiosco con el motivo `manual` (minimiza y quita `TopMost`). | Kiosco suspendido / reanudado |
 | `wake` | Deserializa `WolPayload` y emite el Magic Packet (102 bytes: 6×`0xFF` + MAC×16) a `255.255.255.255:9`, al broadcast dirigido y a la última IP conocida, 3 repeticiones. | "Magic packet enviado a ... para AA:BB:..." |
+| `sync-play` | Alias `syncplay`, `sync_play`. Deserializa `SyncPlayPayload`; si no hay offset de reloj lo mide primero; convierte `StartAtUnixMs` con `ServerClock.ToLocalUtc` y llama a `VlcPlayerManager.PlaySynchronized`. Programa la miniatura para después del arranque. | Programado con X ms de margen · offset del reloj · o "iniciado con N s de compensación" si llegó tarde |
+| `play-playlist` | Alias `playlist`. Deserializa `PlaylistCommandPayload`, mide el reloj si hace falta y llama a `VlcPlayerManager.PlayPlaylist`. El agente avanza los elementos por fin natural o por `DurationSeconds` y repite si `Loop`. | Playlist iniciada/programada con N elementos y offset de reloj |
 | `shutdown` / `restart` | **Simulados** por seguridad (no ejecutan nada). | "deshabilitado por seguridad" |
 | otro | `status = "error"` | Comando no soportado |
 
@@ -334,6 +403,7 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
 - RAM: `WorkingSet64 / GC.GetGCMemoryInfo().TotalAvailableMemoryBytes` (aprox. del proceso, no del sistema).
 - Disco: espacio libre real del drive de `AppContext.BaseDirectory`.
 - `HdmiOk` siempre `true`.
+- Reloj (Bloque 3): `ClockOffsetMs` = offset medido contra `/api/time` y `ClockSynced`; el panel lo muestra en la tarjeta y sirve para diagnosticar sticks con la hora mal.
 
 ### Explorador de archivos (`FileService`)
 - Raíces permitidas: `Agent:FileRoots` (si está vacío, todas las unidades fijas listas).
@@ -367,6 +437,8 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
 - Hilo STA dedicado que crea un `Form` WinForms; en modo kiosco: `FormBorderStyle.None`, maximizado, `TopMost` solo con vídeo, sin cursor, fondo negro; `Escape` alterna maximizado/normal.
 - `Core.Initialize()` y `new LibVLC("--avcodec-hw=any", "--no-video-title-show", "--quiet")`; si falla, el agente sigue en **modo simulado** (sin video, heartbeat/thumbnails funcionan).
 - `Play`: acepta `http/https/rtsp` como URL; cualquier otra cosa se trata como ruta local (`Path.GetFullPath`); loop vía `:input-repeat=-1`. Ya no hace `BringToFront` incondicional: si el kiosco está suspendido el vídeo sigue reproduciéndose minimizado y las miniaturas se capturan igual.
+- `PlaySynchronized(mediaPath, loop, volume, startAtLocalUtc)` (Bloque 3): espera de alta resolución (Task.Delay grueso + `SpinWait` final) hasta el instante ya traducido al reloj local y arranca; si la orden llegó tarde (> 75 ms), arranca inmediato y añade `:start-time` para saltar al punto que le corresponde (no se aplica a `rtsp`, que es directo). Devuelve `SyncPlayResult` (`ScheduledStartUtc`, `StartedImmediately`, `DelayMs`, `StartOffsetSeconds`), que el agente reporta en el `CommandResult`.
+- `PlayPlaylist(items, loop, volume, startAtLocalUtc?)` (Bloque 4): guarda la lista, arranca el primer elemento (o espera al instante indicado) y avanza con `EndReached` o con un `System.Threading.Timer` por `DurationSeconds`. Usa una sesión y una generación para que un temporizador viejo, un fin de vídeo simultáneo o un arranque programado anterior no muevan la lista actual. `Play`/`Stop`/`Dispose` cancelan la playlist.
 - Eventos `Playing/Paused/Stopped/EndReached/EncounteredError` mantienen `HasMedia` sincronizado (fin de vídeo sin loop → `idle` y sin `TopMost`).
 - `Pause`: alterna; `Stop`: idle + stop; `SetVolume`: clamp 0–100.
 - `CaptureThumbnailBase64`: si hay video, `TakeSnapshot(0, temp.jpg, 320, 180)` y devuelve `data:image/jpeg;base64,...`; si no hay video o falla, genera un JPEG sintético 320×180 de standby (fondo degradado, "PCP KIOSK", "EN REPOSO" o "PAUSADO: archivo", ID + hora, punto verde).
@@ -386,6 +458,7 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
 - `SummaryBar.tsx`: total, online, offline y "en reproducción" (online y `currentMedia !== "idle"`).
 - `ScreenCard.tsx`: monitor 16:9 con thumbnail en vivo (badge EN VIVO/STANDBY), efecto "SIN SEÑAL" con barras SMPTE si offline, nombre/ID, MAC e IP (mono, solo si el agente las reportó), badge online, medio actual, CPU/RAM/Disco/Latido, botones Play/Pausar/Stop y panel "Configurar medio / volumen" (ruta local o URL + slider 0–100).
   - Si la pantalla está **offline** aparece **Encender (Wake-on-LAN)**: pide `POST /wake`, muestra cuenta atrás de 45 s y se limpia sola cuando llega el `ScreenStatusChanged` a online. Se deshabilita sin MAC, con `wolEnabled = false` o si `isWired = false` (Wi-Fi), con tooltip explicativo.
+  - Panel "Configurar medio / volumen": incluye **Sincronizar Play** (Bloque 3): selector de margen 5/8/10/15/30 s, botón que llama a `syncPlay` y muestra el desfase de reloj del agente (`clockOffsetMs`) junto al título.
   - `Play` envía `{ mediaPath, loop: true, volume, fitMode: "cover" }`.
   - `Pausar` → `pause`; `Stop` → `stop`; "Aplicar volumen" → `{ volume }`.
   - Ruta por defecto en el input: `C:\videos\promo_verano.mp4`.
@@ -393,10 +466,15 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
 - `FileExplorerModal.tsx`: modal del explorador remoto. Muestra unidades, breadcrumb, listado de carpetas/archivos, tamaño/fecha, subida múltiple a la carpeta actual, borrado con confirmación y botón "Reproducir" para videos (reutiliza el comando `play`). Incluye **drag & drop** sobre el listado (rechaza carpetas y exige una carpeta abierta) y una barra de progreso real en dos fases: `Enviando al servidor` (XHR) y `Entregando al agente` (eventos SignalR), con velocidad, ETA y botón Cancelar. Se abre desde el botón "Archivos" de `ScreenCard` (solo si la pantalla está online).
 - `SystemActionsMenu.tsx`: menú "Sistema" de cada tarjeta con apagar PC, reiniciar, apagar monitor y bloquear sesión; confirmación para acciones destructivas.
 - `src/app/groups/page.tsx`: creación de grupos, selección de pantallas y listado.
-- `GroupCard.tsx`: edición de nombre/membresía, reproducción masiva con ruta/volumen, apagado y reinicio masivos.
+- `GroupCard.tsx`: edición de nombre/membresía, reproducción masiva con ruta/volumen, apagado y reinicio masivos. Incluye **Sincronizar** (ruta/volumen/margen → `POST /api/screens/sync/play` con `groupId`) y **Encender apagadas (N)**: recorre en serie solo las pantallas offline, cableadas, con MAC y WOL habilitado, y muestra un resumen por pantalla (relay usado o error) más el recuento de omitidas.
 - `RemoteDesktopModal.tsx`: modal a pantalla completa con noVNC (`@novnc/novnc/lib/rfb`, import dinámico). Pide sesión a `startRemoteSession`, muestra estado (preparando/conectando/conectado/error), permite *Solo ver*, `Ctrl+Alt+Del`, pantalla completa y reintento; al cerrar desconecta el RFB y llama a `stopRemoteSession`.
 - `ScreenCard.tsx`: botón **Control Total** (solo online) bajo Archivos/Sistema; abre `RemoteDesktopModal`.
-- `Header.tsx`: navegación entre `/` y `/groups`.
+- `Header.tsx`: navegación entre `/`, `/groups` y `/playlists`.
+- `src/app/playlists/page.tsx` (Bloque 4): sección de playlists (editor + tarjetas con reproducción inmediata) y sección de programación (formulario y tarjetas de horarios). Carga `fetchPlaylists` + `fetchSchedules` y, en paralelo, `fetchGroups` para los selectores de destino.
+- `PlaylistEditor.tsx`: nombre, bucle y lista ordenada de elementos (añadir, subir/bajar, quitar, duración en segundos y volumen). Reemplaza la lista completa al guardar.
+- `PlaylistCard.tsx`: resumen de elementos y duración planificada, selector de destino (grupo o pantalla) y botón **Reproducir** (`playPlaylist` con 8 s de margen), edición y borrado. En modo Viewer solo muestra la lista.
+- `ScheduleForm.tsx`: playlist, destino, días ISO, hora local, ventana en minutos y activo. Valida antes de enviar.
+- `ScheduleCard.tsx`: días humanizados (`L–V`, fin de semana, todos), hora, próxima ejecución, última ejecución, zona horaria y acciones **Pausar/Activar**, **Ejecutar ahora**, editar y eliminar.
 
 ### Estado y comunicación — `src/hooks/useScreensSignalR.ts`
 - Carga inicial `GET /api/screens`.
@@ -410,13 +488,17 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
 - `fetchScreens()`: `GET /api/screens`, `cache: "no-store"`.
 - `sendScreenCommand(id, { type, payload })`: `POST /api/screens/{id}/command`; propaga `data.error` del servidor.
 - `wakeScreen(id, relayScreenId?)`: `POST /api/screens/{id}/wake`; devuelve `{ mode, relayScreenId, macAddress, ... }`. El panel usa `mode` para el mensaje del toast.
+- `syncPlay(request)`: `POST /api/screens/sync/play`; acepta `screenIds` o `groupId` y devuelve el instante de arranque (`startAtUtc`, epoch) y el resumen por pantalla.
+- `fetchPlaylists`, `createPlaylist`, `updatePlaylist`, `deletePlaylist` y `playPlaylist(id, request)`: CRUD y reproducción inmediata (Bloque 4).
+- `fetchSchedules`, `createSchedule`, `updateSchedule`, `deleteSchedule` y `runSchedule(id)`: CRUD y ejecución manual de horarios.
 - `fetchFiles(screenId, path?)`, `deleteFile(screenId, path)` y `uploadFile(screenId, directoryPath, file)`: consumen `/api/screens/{id}/files`.
 - `uploadFileWithProgress(screenId, directoryPath, file, { onBrowserProgress, signal })`: sube con `XMLHttpRequest` (progreso real navegador → servidor, cancelable con `AbortController`) y devuelve `{ clientRequestId, promise }`. El tramo servidor → agente se sigue con `subscribeUploadProgress(clientRequestId, cb)` (evento SignalR `FileUploadProgress`). `uploadFile` se mantiene como envoltorio sin progreso.
 - `startRemoteSession(screenId, viewOnly)` y `stopRemoteSession(screenId, sessionId?)`: consumen `/api/screens/{id}/remote/{start|stop}`.
 - `next.config.mjs` usa `output: "standalone"` y `npm start` respeta el `PORT` de la nube. `NEXT_PUBLIC_API_URL` es de build-time: si falta en producción, el panel cae a `http://localhost:5000` y registra un error en consola.
 
 ### Tipos — `src/types/screen.ts`
-Espejo camelCase de los DTOs: `ScreenInfo` (incluye `remoteControlAvailable`), `RemoteSession`, `ThumbnailDto`, `CommandRequest`, `CommandResponse`, `CommandResultDto`, `ToastMessage`.
+Espejo camelCase de los DTOs: `ScreenInfo` (incluye `remoteControlAvailable`, `macAddress`, `localIp`, `wolEnabled`, `isWired`, `clockOffsetMs`, `clockSynced`), `RemoteSession`, `ThumbnailDto`, `CommandRequest`, `CommandResponse`, `CommandResultDto`, `SyncPlayRequest`, `SyncPlayResponse`, `ToastMessage`.
+`src/types/playlist.ts` (`Playlist`, `PlaylistItem`, `PlaylistUpsert`, `PlaylistPlayResponse`) y `src/types/schedule.ts` (`Schedule`, `ScheduleUpsert`, `DAY_LABELS`, `parseDays`, `describeDays`).
 `src/types/novnc.d.ts` declara la superficie mínima de `@novnc/novnc`.
 **Si cambia un DTO en `Pcp.Shared`, actualizar este archivo.**
 
@@ -436,12 +518,16 @@ Espejo camelCase de los DTOs: `ScreenInfo` (incluye `remoteControlAvailable`), `
 10. **Archivos**: el explorador navega por las unidades fijas del agente con lista negra de rutas críticas; solo borra archivos, no carpetas; no sobrescribe archivos existentes; la subida va por chunks Base64 y se confirma en un archivo temporal movido al destino. El panel muestra progreso real: XHR para el tramo navegador → servidor y `FileUploadProgress` (SignalR, identificado por `clientRequestId`) para el tramo servidor → agente. "Reproducir" no descarga el archivo: envía `play` con la ruta local del agente.
 11. **Transferencia de archivos**: el servidor actúa de puente; no almacena los archivos subidos. Si el agente se cae a mitad de una subida, el servidor cancela y el agente limpia el temporal al cancelar; si el proceso muere, puede quedar un `.pcp-upload-*.tmp`.
 12. **Grupos**: un grupo por pantalla; eliminar un grupo solo desasigna pantallas. Los comandos masivos omiten pantallas offline y devuelven el resumen de envíos.
-13. **Comandos de sistema**: `shutdown`, `restart`, `monitor-off` y `lock` son reales en el agente. Están protegidos por `Agent:AllowSystemCommands`, usan 5 s de retardo para apagar/reiniciar y el panel pide confirmación. Sin autenticación en la API, cualquier cliente de la red puede invocarlos: no exponer a Internet en esta fase.
+13. **Comandos de sistema**: `shutdown`, `restart`, `monitor-off` y `lock` son reales en el agente. Están protegidos por `Agent:AllowSystemCommands`, usan 5 s de retardo para apagar/reiniciar y el panel pide confirmación. El endpoint exige JWT con rol `Admin` (cookie del panel).
 14. **Control remoto**: una sesión VNC por pantalla; el agente solo expone el RFB en `127.0.0.1` y sale por WebSocket al servidor. La contraseña RFB es aleatoria de 8 caracteres y vive solo lo que dura la sesión; el servidor la devuelve al panel porque el handshake RFB la exige.
 15. **Caducidad de sesión**: 90 s para que el panel abra el WebSocket; luego indefinida hasta 12 h. Cerrar el modal, cerrar el WebSocket, desconectar el agente o reiniciar el servidor cierra el túnel y restaura la configuración de TightVNC.
 16. **Dependencia externa**: TightVNC debe existir en la mini-PC (o aprovisionarse desde `Agent:Vnc:PackagePath`). El agente debe correr en la sesión interactiva; un servicio de TightVNC activo impide el modo aplicación y se reporta como error al panel.
 17. **Rendimiento**: noVNC usa `scaleViewport`, `qualityLevel≈6` y `compressionLevel≈1`; TightVNC se configura con captura D3D y sin transferencia de archivos. En LAN da ~30–60 fps a 1080p. No se envía audio, portapapeles ni archivos por este canal.
-18. **Wake-on-LAN**: un Magic Packet no cruza Internet, y el servidor vive en Render, así que el paquete lo emite **otro agente online de la misma `NetworkCidr`** (relay) al recibir el comando `wake`; el envío directo desde el servidor es opcional (`Wol:DirectSendEnabled`, solo útil on-prem). Si no hay relay disponible no se puede despertar. El endpoint exige `Admin`, aplica cooldown (`Wol:CooldownSeconds`) y audita el `wake` en `Commands`. Por Wi-Fi el WOL no funciona: el panel deshabilita el botón cuando `IsWired = false`.
+18. **Wake-on-LAN**: un Magic Packet no cruza Internet, y el servidor vive en Render, así que el paquete lo emite **otro agente online de la misma `NetworkCidr`** (relay) al recibir el comando `wake`; el envío directo desde el servidor es opcional (`Wol:DirectSendEnabled`, solo útil on-prem). Si no hay relay disponible no se puede despertar. El endpoint exige `Admin`, aplica cooldown (`Wol:CooldownSeconds`) y audita el `wake` en `Commands`. Por Wi-Fi el WOL no funciona: el panel deshabilita el botón cuando `IsWired = false`. El encendido masivo del grupo se hace en serie desde el panel reutilizando el endpoint individual; cada pantalla cuenta con su propio cooldown y su propio resultado.
+19. **Sincronización de reproducción**: el servidor fija `StartAtUnixMs` en su reloj y todos los agentes reciben el mismo valor; cada uno lo traduce a su reloj con el offset de `/api/time`, así que un stick con la hora desviada arranca igual. El margen mínimo es 3 s (por defecto 8) para absorber la latencia de los comandos. Si la orden llega después del instante, el agente arranca y salta al punto correspondiente para mantener el fotograma alineado. El panel muestra el `startAtUtc` y el resumen de envíos; las pantallas offline se omiten.
+20. **Diagnóstico de reloj**: el offset (`servidor - agente`) viaja en cada heartbeat y se persiste en `Screens.ClockOffsetMs`. Un valor grande (> 1–2 s) explica miniaturas con horas raras y sirve para decidir si hay que sincronizar la hora del stick con NTP.
+21. **Playlists**: una lista ordenada de medios con duración y volumen por elemento. El agente reproduce la secuencia por su cuenta y el servidor no interviene entre elementos; por eso una playlist sobrevive a la caída del servidor, pero no a un reinicio del agente (queda en `idle` hasta la siguiente orden u horario). `stop`/`play` manuales cancelan la playlist en curso.
+22. **Programación**: los horarios se evalúan en el servidor con la zona `Scheduling:TimeZone` y se disparan con 10 s de antelación; el instante de arranque que reciben los agentes es absoluto y pasa por el reloj del Bloque 3, por lo que varias pantallas de un grupo arrancan la playlist a la vez. Solo hay una instancia del programador (si se escala el servidor a varias réplicas, cada una intentaría ejecutar el horario; requiere coordinación distribuida).
 
 ---
 
@@ -470,7 +556,7 @@ powershell -ExecutionPolicy Bypass -File C:\Proyectos\Pcp\scripts\publish-agent.
 ```
 
 Claves de configuración relevantes:
-- `Pcp.Server/appsettings.json` → `Database:MySqlVersion`, `ConnectionStrings:DefaultConnection` (SQLite dev), `Files:MaxUploadMb`, `Wol:*` (`Enabled`, `CooldownSeconds`, `Port`, `DirectSendEnabled`, `PreferredRelayScreenId`), `Auth:*` (emisor, audiencia, cookie, duración de tokens, usuario admin inicial).
+- `Pcp.Server/appsettings.json` → `Database:MySqlVersion`, `ConnectionStrings:DefaultConnection` (SQLite dev), `Files:MaxUploadMb`, `Wol:*` (`Enabled`, `CooldownSeconds`, `Port`, `DirectSendEnabled`, `PreferredRelayScreenId`), `Scheduling:*` (`Enabled`, `TimeZone`, `TickSeconds`, `LeadSeconds`), `Auth:*` (emisor, audiencia, cookie, duración de tokens, usuario admin inicial).
 - `Pcp.Server/appsettings.Production.json` → `Database:Provider=MySql`, `Cors:AllowedOrigins`, `Auth:CookieSameSite=None`. La cadena real y `Auth__SigningKey` **nunca** se versionan: usar `ConnectionStrings__MySql` o `DATABASE_URL`/`MYSQL_URL`/`MYSQL_ADDON_URI`, más `Auth__SigningKey`, `Auth__AdminPassword`, `Cors__AllowedOrigins__0..N`, `PORT` y `Files__MaxUploadMb`.
 - `Pcp.Agent/appsettings.json` (opcional) → `Agent:ScreenId`, `Agent:Name`, `Agent:Token`, `Agent:ServerUrl`, `Agent:DevMode`, `Agent:AllowSystemCommands`, `Agent:SystemCommandDelaySeconds`, `Agent:FileRoots`, `Agent:ProtectedPaths`, `Agent:MaxUploadMb`, `Agent:LogPath`, `Agent:Kiosk:TopMostOnlyWhilePlaying`, `Agent:Kiosk:IdleWindowState`, `Agent:Vnc:*`, `Agent:Wol:InterfaceName` y `Agent:Wol:MacOverride` (overrides manuales de la NIC para WOL; el override por nombre selecciona esa interfaz aunque parezca virtual). Se puede omitir y usar `PCP_SERVER_URL`, `PCP_SCREEN_ID`, `PCP_SCREEN_NAME`, `PCP_TOKEN` o `PCP_Agent__*`.
 - `Pcp.Web/.env.local` (dev) y `Pcp.Web/.env.production` (build) → `NEXT_PUBLIC_API_URL` (y `NEXT_PUBLIC_SERVER_URL`).
@@ -495,11 +581,10 @@ o con `Agent:ScreenId` (appsettings/CLI).
 ## 8. Huecos conocidos / deuda técnica
 
 - No existe descarga de archivos desde el panel ni renombrado/movimiento; el explorador solo lista, sube, borra y reproduce videos.
-- El explorador no tiene autenticación propia: hereda la ausencia de auth del resto del sistema.
+- Los endpoints de archivos y grupos usan el JWT del panel (Admin/Viewer), pero no hay permisos por pantalla: cualquier `Admin` puede operar toda la flota.
 - No hay endpoints para consultar historial de comandos ni CRUD completo de pantallas (solo register/list/detail/command y grupos).
-- Los comandos de sistema reales no tienen autenticación ni autorización por roles; requieren una capa de auth antes de producción.
-- No hay autenticación real, rate limiting ni HTTPS.
-- No hay tests automatizados. Las migraciones EF son específicas de MySQL (`InitialCreate`); SQLite de desarrollo usa `EnsureCreated` y no aplica esas migraciones.
+- No hay HTTPS propio: el panel y la API dependen del proxy de la nube (Render/Vercel). El rate limiting solo cubre el login (10 intentos/5 min por IP).
+- No hay tests automatizados. Las migraciones EF son específicas de MySQL (`InitialCreate`, `AddAuthUsers`, `AddWakeOnLan`, `AddClockSync`); SQLite de desarrollo usa `EnsureCreated` y no aplica esas migraciones.
 - Gestión de usuarios incompleta: no hay CRUD de `Users` ni cambio de contraseña desde el panel; los usuarios adicionales deben insertarse en BD con el hash PBKDF2. El token de dispositivo por defecto `dev-token` sigue aceptándose para no romper la flota y se registra una advertencia en producción; debe rotarse antes de exponer el sistema.
 - El JWT del agente dura 30 días y se renueva solo al reiniciar o al reconectar SignalR; no hay endpoint de refresh explícito.
 - `fitMode` se envía pero **no se aplica** en el agente.
@@ -513,6 +598,11 @@ o con `Agent:ScreenId` (appsettings/CLI).
 - Si el agente corre como servicio (sesión 0) o queda un `tvnserver` huérfano, el control remoto falla con error explícito; no hay reintento automático de arranque del VNC.
 - El agente es `WinExe`: no hay consola y el diagnóstico exige leer `C:\ProgramData\PcpAgent\agent.log` (o `%LOCALAPPDATA%\Pcp\logs\agent.log` si no hay permisos).
 - El watchdog comprueba el proceso por nombre (`Pcp.Agent.exe`): asume una pantalla por stick. En desarrollo con varios agentes en el mismo equipo solo vigila que exista al menos uno.
+- **Sincronización**: el offset se mide contra la hora del servidor, pero si un stick tiene el reloj muy desviado el margen de espera puede no bastar (se compensa saltando en el medio, no se corrige el reloj del sistema). No hay verificación posterior de que todos los agentes arrancaron en el mismo fotograma ni métrica de desfase real entre pantallas; el `CommandResult` solo informa el margen y el salto aplicado.
+- La sincronización no controla el audio de forma especial ni resincroniza si un agente se reconecta a mitad de la reproducción; `sync-play` siempre reinicia el medio desde el punto calculado.
+- El encendido masivo por grupo no tiene endpoint propio: el panel itera las pantallas en serie, así que un grupo grande tarda y no hay resumen persistido en el servidor (solo los `Commands` auditados de cada `wake`).
+- **Playlists**: no hay transiciones (fade), ni subtítulos, ni audio independiente por elemento; la duración por elemento es opcional y, si es 0, dependen del fin natural del vídeo, por lo que pantallas con códecs/tiempos distintos pueden desincronizarse a partir del segundo elemento. El agente no persiste la playlist en disco: si se reinicia, no reanuda sola.
+- **Programación**: el programador es un `BackgroundService` de una sola instancia y no hay calendario de excepciones (festivos, vacaciones) ni prioridad entre horarios solapados: si dos coinciden, se lanzan ambos y gana el último comando. No se recuperan ejecuciones perdidas si el servidor está caído durante toda la ventana. La zona horaria es global (`Scheduling:TimeZone`), no por horario.
 
 ---
 

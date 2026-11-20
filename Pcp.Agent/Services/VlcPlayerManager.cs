@@ -1,11 +1,14 @@
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Globalization;
 using System.Windows.Forms;
 using LibVLCSharp.Shared;
 using LibVLCSharp.WinForms;
 using Microsoft.Extensions.Configuration;
 using Pcp.Agent.Logging;
+using Pcp.Shared.Dtos;
 
 namespace Pcp.Agent.Services;
 
@@ -43,6 +46,9 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
     /// <summary>Motivo de suspensión usado por las órdenes manuales del panel.</summary>
     public const string ManualSuspendReason = "manual";
 
+    /// <summary>Margen (ms) por debajo del cual un arranque sincronizado se considera inmediato.</summary>
+    private const long SynchronousStartToleranceMs = 75;
+
     private LibVLC? _libVLC;
     private MediaPlayer? _mediaPlayer;
     private VideoView? _videoView;
@@ -63,6 +69,23 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
     private volatile bool _hasMedia;
     private bool _cursorHidden;
     private bool _suspendedLogged;
+
+    // ── Playlist (Bloque 4) ─────────────────────────────────────────────────
+    // El agente reproduce la lista de forma autónoma: el servidor envía todos
+    // los elementos de una vez y aquí se avanza al siguiente por fin natural
+    // del medio o por la duración planificada del elemento.
+    private readonly object _playlistLock = new();
+    private List<PlaylistItemDto>? _playlist;
+    private int _playlistIndex;
+    private bool _playlistLoop;
+    private int _playlistVolume = 80;
+    private bool _playlistActive;
+    private System.Threading.Timer? _playlistTimer;
+
+    // Identifican la reproducción en curso: evitan que un temporizador viejo o
+    // un arranque programado de una playlist anterior muevan la lista actual.
+    private Guid _playlistSession;
+    private int _playlistGeneration;
 
     public string CurrentMedia => _currentMedia;
     public int Volume => _volume;
@@ -225,6 +248,13 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
 
         player.EndReached += (s, e) =>
         {
+            // En una playlist el fin del elemento es el disparo para el siguiente.
+            if (IsPlaylistActive)
+            {
+                AdvancePlaylist(_playlistGeneration);
+                return;
+            }
+
             // Sin loop el medio termina: vuelve a reposo y el kiosco deja de ser TopMost.
             _currentMedia = "idle";
             _hasMedia = false;
@@ -243,6 +273,322 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
     /// </summary>
     public void Play(string mediaPath, bool loop = false, int volume = 80)
     {
+        // Una reproducción manual cancela cualquier playlist en curso.
+        StopPlaylistState();
+
+        if (!StartMedia(mediaPath, loop, volume, startOffsetSeconds: 0))
+        {
+            _volume = Math.Clamp(volume, 0, 100);
+            _currentMedia = mediaPath;
+        }
+
+        // No se fuerza BringToFront aquí: si el kiosco está suspendido (VNC activo),
+        // el vídeo sigue reproduciéndose minimizado para no tapar el escritorio.
+        ApplyWindowMode();
+    }
+
+    /// <summary>
+    /// Arranca un medio en un instante concreto del reloj local (ya corregido con el
+    /// offset del servidor) para reproducir lo mismo a la vez en varias pantallas.
+    ///
+    /// Si el instante está en el futuro, espera y arranca en ese momento. Si ya pasó
+    /// (la orden llegó tarde), arranca de inmediato y salta al punto que le
+    /// correspondería, de modo que el fotograma sigue alineado con el resto.
+    /// </summary>
+    public SyncPlayResult PlaySynchronized(
+        string mediaPath,
+        bool loop,
+        int volume,
+        DateTime startAtLocalUtc)
+    {
+        var delayMs = (long)Math.Round((startAtLocalUtc - DateTime.UtcNow).TotalMilliseconds);
+
+        // Arranque inmediato: la orden llegó con el margen agotado.
+        if (delayMs <= SynchronousStartToleranceMs)
+        {
+            var lateSeconds = Math.Max(0, -delayMs) / 1000.0;
+            var started = StartMedia(mediaPath, loop, volume, lateSeconds);
+            ApplyWindowMode();
+
+            return new SyncPlayResult
+            {
+                ScheduledStartUtc = startAtLocalUtc,
+                StartedImmediately = true,
+                StartedSuccessfully = started,
+                DelayMs = delayMs,
+                StartOffsetSeconds = lateSeconds
+            };
+        }
+
+        // Arranque programado: la espera no bloquea al hilo que atiende el comando.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await WaitUntilAsync(startAtLocalUtc);
+
+                var lateSeconds = Math.Max(0, (DateTime.UtcNow - startAtLocalUtc).TotalMilliseconds) / 1000.0;
+                if (StartMedia(mediaPath, loop, volume, lateSeconds))
+                {
+                    ApplyWindowMode();
+                    AgentLog.Info(
+                        $"[SYNC PLAY] Arranque en {startAtLocalUtc:HH:mm:ss.fff} UTC " +
+                        $"(retraso {lateSeconds * 1000:F0} ms).");
+                }
+            }
+            catch (Exception ex)
+            {
+                AgentLog.Error($"[SYNC PLAY] No se pudo arrancar el medio: {ex.Message}");
+            }
+        });
+
+        return new SyncPlayResult
+        {
+            ScheduledStartUtc = startAtLocalUtc,
+            StartedImmediately = false,
+            StartedSuccessfully = true,
+            DelayMs = delayMs,
+            StartOffsetSeconds = 0
+        };
+    }
+
+    /// <summary>
+    /// Reproduce una playlist completa de forma autónoma (Bloque 4). Devuelve
+    /// false si no hay elementos o si LibVLC no está disponible (modo degradado).
+    ///
+    /// <paramref name="startAtLocalUtc"/> permite arrancar el primer elemento en
+    /// un instante concreto (reloj local ya corregido), igual que <see cref="PlaySynchronized"/>.
+    /// </summary>
+    public bool PlayPlaylist(
+        IReadOnlyList<PlaylistItemDto>? items,
+        bool loop,
+        int volume,
+        DateTime? startAtLocalUtc = null)
+    {
+        if (_libVLC == null || _mediaPlayer == null)
+        {
+            AgentLog.Warn("[PLAYLIST] LibVLC no disponible: no se puede reproducir la playlist.");
+            return false;
+        }
+
+        var validItems = (items ?? Array.Empty<PlaylistItemDto>())
+            .Where(item => !string.IsNullOrWhiteSpace(item.MediaPath))
+            .ToList();
+
+        if (validItems.Count == 0)
+        {
+            AgentLog.Warn("[PLAYLIST] La playlist no tiene elementos válidos.");
+            return false;
+        }
+
+        Guid session;
+
+        lock (_playlistLock)
+        {
+            DisposePlaylistTimerLocked();
+            _playlist = validItems;
+            _playlistIndex = 0;
+            _playlistLoop = loop;
+            _playlistVolume = Math.Clamp(volume, 0, 100);
+            _playlistActive = true;
+            session = Guid.NewGuid();
+            _playlistSession = session;
+            _playlistGeneration = 0;
+        }
+
+        AgentLog.Info(
+            $"[PLAYLIST] Recibidos {validItems.Count} elemento(s) (loop={loop})" +
+            (startAtLocalUtc.HasValue ? $", arranque {startAtLocalUtc.Value:HH:mm:ss.fff} UTC." : ", arranque inmediato."));
+
+        var delayMs = startAtLocalUtc.HasValue
+            ? (long)Math.Round((startAtLocalUtc.Value - DateTime.UtcNow).TotalMilliseconds)
+            : long.MinValue;
+
+        if (startAtLocalUtc.HasValue && delayMs > SynchronousStartToleranceMs)
+        {
+            var startAt = startAtLocalUtc.Value;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await WaitUntilAsync(startAt);
+                    if (IsPlaylistSessionActive(session))
+                    {
+                        StartCurrentPlaylistItem();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AgentLog.Error($"[PLAYLIST] No se pudo arrancar la playlist: {ex.Message}");
+                }
+            });
+        }
+        else
+        {
+            StartCurrentPlaylistItem();
+        }
+
+        return true;
+    }
+
+    /// <summary>Indica si hay una playlist reproduciéndose (la usa el fin de medio).</summary>
+    private bool IsPlaylistActive
+    {
+        get
+        {
+            lock (_playlistLock)
+            {
+                return _playlistActive;
+            }
+        }
+    }
+
+    private bool IsPlaylistSessionActive(Guid session)
+    {
+        lock (_playlistLock)
+        {
+            return _playlistActive && _playlistSession == session;
+        }
+    }
+
+    /// <summary>Carga y reproduce el elemento actual; si la lista terminó, vuelve al inicio o para.</summary>
+    private void StartCurrentPlaylistItem()
+    {
+        PlaylistItemDto? item = null;
+        var finished = false;
+        var generation = 0;
+
+        lock (_playlistLock)
+        {
+            if (!_playlistActive || _playlist == null)
+            {
+                return;
+            }
+
+            if (_playlistIndex >= _playlist.Count)
+            {
+                if (_playlistLoop)
+                {
+                    _playlistIndex = 0;
+                }
+                else
+                {
+                    _playlistActive = false;
+                    finished = true;
+                }
+            }
+
+            if (!finished)
+            {
+                item = _playlist[_playlistIndex];
+                generation = _playlistGeneration;
+            }
+        }
+
+        if (finished || item == null)
+        {
+            DisposePlaylistTimer();
+            _currentMedia = "idle";
+            _hasMedia = false;
+            ApplyWindowMode();
+            AgentLog.Info("[PLAYLIST] Playlist terminada sin loop: el kiosco vuelve a reposo.");
+            return;
+        }
+
+        var volume = item.Volume > 0 ? item.Volume : _playlistVolume;
+        AgentLog.Info(
+            $"[PLAYLIST] Elemento {_playlistIndex + 1}: {item.MediaPath} " +
+            $"(dur={item.DurationSeconds}s, vol={volume}%)");
+
+        StartMedia(item.MediaPath, loop: false, volume, startOffsetSeconds: 0);
+        ApplyWindowMode();
+        ArmPlaylistTimer(item.DurationSeconds, generation);
+    }
+
+    /// <summary>Pasa al siguiente elemento (por fin natural del medio o por duración).</summary>
+    private void AdvancePlaylist(int? expectedGeneration = null)
+    {
+        lock (_playlistLock)
+        {
+            DisposePlaylistTimerLocked();
+
+            if (!_playlistActive)
+            {
+                return;
+            }
+
+            // Fin de vídeo y temporizador pueden coincidir: solo uno avanza.
+            if (expectedGeneration.HasValue && expectedGeneration.Value != _playlistGeneration)
+            {
+                return;
+            }
+
+            _playlistGeneration++;
+            _playlistIndex++;
+        }
+
+        StartCurrentPlaylistItem();
+    }
+
+    /// <summary>
+    /// Arma el temporizador de duración del elemento. Duración 0 significa
+    /// "hasta el final natural del medio" y no crea temporizador.
+    /// </summary>
+    private void ArmPlaylistTimer(int durationSeconds, int generation)
+    {
+        lock (_playlistLock)
+        {
+            DisposePlaylistTimerLocked();
+
+            if (!_playlistActive || durationSeconds <= 0)
+            {
+                return;
+            }
+
+            _playlistTimer = new System.Threading.Timer(
+                _ => AdvancePlaylist(generation),
+                null,
+                TimeSpan.FromSeconds(Math.Clamp(durationSeconds, 1, 86_400)),
+                Timeout.InfiniteTimeSpan);
+        }
+    }
+
+    private void DisposePlaylistTimer()
+    {
+        lock (_playlistLock)
+        {
+            DisposePlaylistTimerLocked();
+        }
+    }
+
+    /// <summary>Debe llamarse con <see cref="_playlistLock"/> tomado.</summary>
+    private void DisposePlaylistTimerLocked()
+    {
+        _playlistTimer?.Dispose();
+        _playlistTimer = null;
+    }
+
+    /// <summary>Cancela la playlist en curso (parada manual, nuevo play o cierre).</summary>
+    private void StopPlaylistState()
+    {
+        lock (_playlistLock)
+        {
+            DisposePlaylistTimerLocked();
+            _playlistActive = false;
+            _playlist = null;
+            _playlistIndex = 0;
+            _playlistGeneration = 0;
+            _playlistSession = Guid.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Carga el medio en LibVLC y lo reproduce. Un <paramref name="startOffsetSeconds"/>
+    /// mayor que cero hace que el demuxer empiece en ese punto (compensación de retraso).
+    /// </summary>
+    private bool StartMedia(string mediaPath, bool loop, int volume, double startOffsetSeconds)
+    {
         _volume = Math.Clamp(volume, 0, 100);
         _currentMedia = mediaPath;
 
@@ -250,18 +596,19 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
         {
             // Modo degradado: no hay vídeo real, la ventana permanece en reposo.
             _hasMedia = false;
-            ApplyWindowMode();
-            return;
+            return false;
         }
 
         try
         {
             // Determinar si es URL web o archivo local
             Media media;
+            var isLiveStream = false;
             if (Uri.TryCreate(mediaPath, UriKind.Absolute, out var uriResult) &&
                 (uriResult.Scheme == Uri.UriSchemeHttp || uriResult.Scheme == Uri.UriSchemeHttps || uriResult.Scheme == "rtsp"))
             {
                 media = new Media(_libVLC, uriResult);
+                isLiveStream = uriResult.Scheme == "rtsp";
             }
             else
             {
@@ -275,21 +622,45 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
                 media.AddOption(":input-repeat=-1");
             }
 
+            if (startOffsetSeconds > 0.15 && !isLiveStream)
+            {
+                // Cultura invariante: en es-ES el separador decimal es la coma y
+                // LibVLC solo entiende el punto.
+                media.AddOption(
+                    ":start-time=" + startOffsetSeconds.ToString("0.###", CultureInfo.InvariantCulture));
+            }
+
             _mediaPlayer.Media = media;
             _mediaPlayer.Volume = _volume;
             _mediaPlayer.Play();
 
             _hasMedia = true;
+            return true;
         }
         catch (Exception ex)
         {
             _hasMedia = false;
             AgentLog.Error($"[VLC PLAY ERROR] {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>Espera de alta resolución hasta el instante indicado (reloj local).</summary>
+    private static async Task WaitUntilAsync(DateTime targetUtc)
+    {
+        // Task.Delay tiene una resolución de ~15 ms: se espera de forma gruesa y
+        // el último tramo se cubre con una espera activa muy corta.
+        var coarse = (targetUtc - DateTime.UtcNow) - TimeSpan.FromMilliseconds(100);
+        if (coarse > TimeSpan.Zero)
+        {
+            await Task.Delay(coarse);
         }
 
-        // No se fuerza BringToFront aquí: si el kiosco está suspendido (VNC activo),
-        // el vídeo sigue reproduciéndose minimizado para no tapar el escritorio.
-        ApplyWindowMode();
+        var spin = Stopwatch.StartNew();
+        while (DateTime.UtcNow < targetUtc && spin.Elapsed < TimeSpan.FromSeconds(2))
+        {
+            Thread.SpinWait(150);
+        }
     }
 
     /// <summary>
@@ -315,6 +686,8 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
     /// </summary>
     public void Stop()
     {
+        StopPlaylistState();
+
         _currentMedia = "idle";
         _hasMedia = false;
         if (_mediaPlayer != null)
@@ -691,6 +1064,8 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
 
         try
         {
+            StopPlaylistState();
+
             _mediaPlayer?.Stop();
             _mediaPlayer?.Dispose();
             _libVLC?.Dispose();
@@ -710,4 +1085,25 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
             // Limpieza sin bloquear
         }
     }
+}
+
+/// <summary>
+/// Resultado de programar una reproducción sincronizada en el reproductor.
+/// </summary>
+public sealed class SyncPlayResult
+{
+    /// <summary>Instante de arranque solicitado, en el reloj local del agente.</summary>
+    public DateTime ScheduledStartUtc { get; init; }
+
+    /// <summary>True si el margen se había agotado y se arrancó de inmediato.</summary>
+    public bool StartedImmediately { get; init; }
+
+    /// <summary>False si LibVLC no está disponible (modo degradado).</summary>
+    public bool StartedSuccessfully { get; init; }
+
+    /// <summary>Milisegundos entre la orden y el arranque (negativo si llegó tarde).</summary>
+    public long DelayMs { get; init; }
+
+    /// <summary>Segundos de salto aplicados al medio para recuperar el retraso.</summary>
+    public double StartOffsetSeconds { get; init; }
 }

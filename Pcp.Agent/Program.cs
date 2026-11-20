@@ -150,6 +150,7 @@ var host = Host.CreateDefaultBuilder(args)
         services.AddSingleton<AgentTokenProvider>();
         services.AddSingleton<NetworkInfoProvider>();
         services.AddSingleton<WakeOnLanSender>();
+        services.AddSingleton<ServerClock>();
         services.AddHostedService<AgentService>();
     })
     .Build();

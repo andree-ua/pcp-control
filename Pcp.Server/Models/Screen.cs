@@ -64,6 +64,12 @@ public class Screen
     /// <summary>Permite al administrador excluir la pantalla del Wake-on-LAN.</summary>
     public bool WolEnabled { get; set; } = true;
 
+    /// <summary>
+    /// Desfase del reloj del agente respecto al servidor en milisegundos
+    /// (servidor - agente). Null si el agente aún no sincronizó contra /api/time.
+    /// </summary>
+    public int? ClockOffsetMs { get; set; }
+
     /// <summary>Último fotograma capturado en Base64 para vista previa (mantenido en memoria rápida).</summary>
     [NotMapped]
     public string? ThumbnailBase64 { get; set; }

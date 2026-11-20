@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { ScreenInfo } from "@/types/screen";
-import { sendScreenCommand, wakeScreen } from "@/services/api";
+import { sendScreenCommand, syncPlay, wakeScreen } from "@/services/api";
 import { useAuth } from "@/context/AuthContext";
 import { FileExplorerModal } from "@/components/FileExplorerModal";
 import { RemoteDesktopModal } from "@/components/RemoteDesktopModal";
@@ -24,6 +24,8 @@ import {
   FolderOpen,
   MonitorSmartphone,
   Power,
+  AlarmClock,
+  Loader2,
 } from "lucide-react";
 
 interface ScreenCardProps {
@@ -40,6 +42,7 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
   const [showRemote, setShowRemote] = useState(false);
   const [customMedia, setCustomMedia] = useState("C:\\videos\\promo_verano.mp4");
   const [customVolume, setCustomVolume] = useState(screen.volume || 80);
+  const [syncLead, setSyncLead] = useState(8);
   const [waking, setWaking] = useState(false);
   const [wakeCountdown, setWakeCountdown] = useState(0);
 
@@ -129,6 +132,53 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
 
   const handleVolumeSubmit = () => {
     handleCommand("volume", { volume: customVolume });
+  };
+
+  /**
+   * Programa un arranque sincronizado en esta pantalla. Sirve para alinear su
+   * vídeo con el resto de la flota cuando ya se lanzó en grupo (o para probar
+   * el desfase de reloj del stick).
+   */
+  const handleSyncPlay = async () => {
+    if (!isAdmin) {
+      onError("Permisos insuficientes", "Tu cuenta es Viewer: no puede enviar comandos.");
+      return;
+    }
+
+    if (!isOnline) {
+      onError("Pantalla Offline", `La pantalla [${screen.id}] está desconectada.`);
+      return;
+    }
+
+    try {
+      setLoadingAction("sync-play");
+      const result = await syncPlay({
+        screenIds: [screen.id],
+        mediaPath: customMedia.trim() || "C:\\videos\\promo_verano.mp4",
+        loop: true,
+        volume: customVolume,
+        fitMode: "cover",
+        startInSeconds: syncLead,
+      });
+
+      if (result.sent > 0) {
+        const startLocal = new Date(result.startAtUtc).toLocaleTimeString();
+        onSuccess(
+          "Play sincronizado",
+          `[${screen.id}] arrancará a las ${startLocal} (reloj del servidor).`
+        );
+      } else {
+        onError(
+          "Play sincronizado",
+          `El agente no aceptó la orden (offline=${result.offline}, fallidas=${result.failed}).`
+        );
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Error al programar la reproducción";
+      onError("Play sincronizado", msg);
+    } finally {
+      setLoadingAction(null);
+    }
   };
 
   const handleWake = async () => {
@@ -519,6 +569,57 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
                     onChange={(e) => setCustomVolume(Number(e.target.value))}
                     className="w-full accent-indigo-500 h-1 bg-zinc-800 rounded-lg appearance-none cursor-pointer"
                   />
+                </div>
+
+                {/* Play sincronizado: arranque en un instante del reloj del servidor */}
+                <div className="pt-2 mt-1 border-t border-zinc-800/80 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="text-[10px] uppercase tracking-wider text-zinc-400 font-semibold flex items-center gap-1">
+                      <AlarmClock className="w-3 h-3" /> Play sincronizado
+                    </label>
+                    <span
+                      className="text-[10px] font-mono text-zinc-500"
+                      title="Desfase del reloj del agente respecto al servidor (medido contra /api/time)"
+                    >
+                      {screen.clockOffsetMs != null
+                        ? `reloj ${screen.clockOffsetMs > 0 ? "+" : ""}${screen.clockOffsetMs} ms`
+                        : "reloj sin sincronizar"}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    <select
+                      value={syncLead}
+                      onChange={(e) => setSyncLead(Number(e.target.value))}
+                      disabled={!isOnline || !isAdmin}
+                      className="bg-zinc-900 border border-zinc-800 rounded-lg px-2 py-1.5 text-zinc-200 text-[11px] focus:outline-none focus:border-sky-500 disabled:opacity-40"
+                      title="Margen antes del arranque"
+                    >
+                      <option value={5}>5 s</option>
+                      <option value={8}>8 s</option>
+                      <option value={10}>10 s</option>
+                      <option value={15}>15 s</option>
+                      <option value={30}>30 s</option>
+                    </select>
+                    <button
+                      onClick={handleSyncPlay}
+                      disabled={!isOnline || !isAdmin || loadingAction === "sync-play"}
+                      className="flex-1 flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-medium disabled:opacity-40 disabled:pointer-events-none"
+                      title={isAdmin ? "Reproducir este medio en el instante del reloj del servidor" : "Solo administradores"}
+                    >
+                      {loadingAction === "sync-play" ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <AlarmClock className="w-3.5 h-3.5" />
+                      )}
+                      Sincronizar Play
+                    </button>
+                  </div>
+
+                  <p className="text-[10px] text-zinc-600 leading-snug">
+                    Usa la ruta y el volumen de arriba. El agente espera el instante del
+                    servidor y compensa el retraso si la orden llega tarde.
+                  </p>
                 </div>
               </div>
             )}

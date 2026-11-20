@@ -26,6 +26,7 @@ public class AgentService : BackgroundService
     private readonly AgentTokenProvider _tokens;
     private readonly NetworkInfoProvider _networkInfo;
     private readonly WakeOnLanSender _wakeOnLan;
+    private readonly ServerClock _clock;
 
     private HubConnection? _hubConnection;
 
@@ -37,7 +38,8 @@ public class AgentService : BackgroundService
         VncRemoteControlService remoteControl,
         AgentTokenProvider tokens,
         NetworkInfoProvider networkInfo,
-        WakeOnLanSender wakeOnLan)
+        WakeOnLanSender wakeOnLan,
+        ServerClock clock)
     {
         _config = config;
         _logger = logger;
@@ -47,6 +49,7 @@ public class AgentService : BackgroundService
         _tokens = tokens;
         _networkInfo = networkInfo;
         _wakeOnLan = wakeOnLan;
+        _clock = clock;
         _playerManager = new VlcPlayerManager(config);
 
         // El túnel VNC suspende el kiosco mientras el operador usa el escritorio.
@@ -75,6 +78,36 @@ public class AgentService : BackgroundService
 
         // 1. Intentar pre-registro REST en el servidor
         await TryRegisterRestAsync(serverUrl, screenId, screenName, token, network, stoppingToken);
+
+        // 1b. Referencia de hora del servidor (Bloque 3). Se acota el tiempo para
+        // que un servidor lento no retrase el arranque: si falla, el bucle de
+        // heartbeat reintenta en segundo plano.
+        using (var clockCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken))
+        {
+            clockCts.CancelAfter(TimeSpan.FromSeconds(10));
+
+            try
+            {
+                if (await _clock.SyncAsync(clockCts.Token))
+                {
+                    AgentLog.Info(
+                        $"   Reloj: offset {_clock.OffsetMs:+0;-0;0} ms respecto al servidor " +
+                        $"(RTT {_clock.RoundTripMs:F0} ms)");
+                }
+                else
+                {
+                    AgentLog.Warn("   Reloj: sin referencia del servidor; sync-play usará el reloj local.");
+                }
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                AgentLog.Warn("   Reloj: la medición agotó el tiempo; se reintentará en segundo plano.");
+            }
+        }
 
         // 2. Configuración de conexión SignalR con política de reconexión automática.
         // La identidad viaja en el JWT obtenido tras el registro; SignalR lo adjunta
@@ -123,6 +156,9 @@ public class AgentService : BackgroundService
             // La red pudo cambiar mientras el agente estaba desconectado (DHCP,
             // cambio de adaptador): se vuelve a detectar para el próximo heartbeat.
             AgentLog.Info($"[RED] {_networkInfo.Refresh().Describe()}");
+
+            // La hora del servidor también se revalida tras una reconexión.
+            RefreshClockInBackground();
             return Task.CompletedTask;
         };
 
@@ -202,6 +238,12 @@ public class AgentService : BackgroundService
         var heartbeatInterval = TimeSpan.FromSeconds(10);
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Refresco perezoso del offset de reloj sin bloquear el latido.
+            if (_clock.IsStale)
+            {
+                RefreshClockInBackground(stoppingToken);
+            }
+
             await EmitHeartbeatAsync(screenId);
             try
             {
@@ -332,6 +374,25 @@ public class AgentService : BackgroundService
     }
 
     /// <summary>
+    /// Revalida el offset de reloj en segundo plano (reconexión o caducidad),
+    /// sin bloquear el latido ni propagar errores de red.
+    /// </summary>
+    private void RefreshClockInBackground(CancellationToken cancellationToken = default)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _clock.SyncAsync(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug("No se pudo refrescar el reloj del servidor: {Message}", ex.Message);
+            }
+        }, CancellationToken.None);
+    }
+
+    /// <summary>
     /// Captura y emite la miniatura (fotograma o estado standby) hacia el servidor vía SignalR.
     /// </summary>
     private async Task EmitThumbnailAsync(string screenId)
@@ -390,7 +451,9 @@ public class AgentService : BackgroundService
             LocalIp = network.LocalIp,
             SubnetMask = network.SubnetMask,
             NetworkCidr = network.NetworkCidr,
-            IsWired = network.IsWired
+            IsWired = network.IsWired,
+            ClockOffsetMs = _clock.HasSync ? _clock.OffsetMilliseconds : null,
+            ClockSynced = _clock.HasSync
         };
 
         try
@@ -570,6 +633,147 @@ public class AgentService : BackgroundService
                     _ = Task.Run(async () =>
                     {
                         await Task.Delay(1000);
+                        await EmitThumbnailAsync(screenId);
+                    });
+                    break;
+
+                case "sync-play":
+                case "syncplay":
+                case "sync_play":
+                    // Bloque 3: el servidor fija un instante absoluto en SU reloj;
+                    // aquí se traduce al reloj local con el offset de /api/time,
+                    // de modo que todas las pantallas arrancan a la vez.
+                    SyncPlayPayload? syncPayload = null;
+                    if (!string.IsNullOrWhiteSpace(command.PayloadJson))
+                    {
+                        try
+                        {
+                            syncPayload = JsonSerializer.Deserialize<SyncPlayPayload>(command.PayloadJson,
+                                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning("Error deserializando SyncPlayPayload: {Message}", ex.Message);
+                        }
+                    }
+
+                    if (syncPayload == null ||
+                        string.IsNullOrWhiteSpace(syncPayload.MediaPath) ||
+                        syncPayload.StartAtUnixMs <= 0)
+                    {
+                        status = "error";
+                        detail = "Comando sync-play sin medio o sin instante de arranque válido.";
+                        AgentLog.Error($"[SYNC PLAY] {detail}");
+                        break;
+                    }
+
+                    if (!_clock.HasSync)
+                    {
+                        await _clock.SyncAsync();
+                    }
+
+                    var localStart = _clock.ToLocalUtc(syncPayload.StartAtUnixMs);
+                    var syncResult = _playerManager.PlaySynchronized(
+                        syncPayload.MediaPath,
+                        syncPayload.Loop,
+                        syncPayload.Volume,
+                        localStart);
+
+                    if (!syncResult.StartedSuccessfully)
+                    {
+                        status = "error";
+                        detail = "LibVLC no está disponible en este agente: no se pudo reproducir el medio sincronizado.";
+                        AgentLog.Error($"[SYNC PLAY] {detail}");
+                        break;
+                    }
+
+                    detail = syncResult.StartedImmediately
+                        ? $"Play sincronizado iniciado con {syncResult.StartOffsetSeconds:F1} s de compensación " +
+                          $"(offset de reloj {_clock.OffsetMs:0} ms)."
+                        : $"Play sincronizado programado en {syncResult.DelayMs} ms " +
+                          $"(token {syncPayload.SyncToken ?? "-"}, offset de reloj {_clock.OffsetMs:0} ms).";
+
+                    AgentLog.Info(
+                        $"[SYNC PLAY] {syncPayload.MediaPath} | inicio local {localStart:HH:mm:ss.fff} UTC | " +
+                        $"servidor {syncPayload.StartAtUnixMs} | {detail}");
+
+                    // Miniatura después del arranque real, no antes.
+                    var thumbnailDelay = Math.Clamp(syncResult.DelayMs + 1500, 1000, 120000);
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay((int)thumbnailDelay);
+                        await EmitThumbnailAsync(screenId);
+                    });
+                    break;
+
+                case "play-playlist":
+                case "playlist":
+                    // Bloque 4: el agente reproduce toda la lista por su cuenta y
+                    // avanza por fin natural del medio o por la duración indicada.
+                    PlaylistCommandPayload? playlistPayload = null;
+                    if (!string.IsNullOrWhiteSpace(command.PayloadJson))
+                    {
+                        try
+                        {
+                            playlistPayload = JsonSerializer.Deserialize<PlaylistCommandPayload>(command.PayloadJson,
+                                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning("Error deserializando PlaylistCommandPayload: {Message}", ex.Message);
+                        }
+                    }
+
+                    if (playlistPayload == null || playlistPayload.Items.Count == 0)
+                    {
+                        status = "error";
+                        detail = "Comando play-playlist sin elementos.";
+                        AgentLog.Error($"[PLAYLIST] {detail}");
+                        break;
+                    }
+
+                    DateTime? playlistStart = null;
+                    if (playlistPayload.StartAtUnixMs is > 0)
+                    {
+                        if (!_clock.HasSync)
+                        {
+                            await _clock.SyncAsync();
+                        }
+
+                        playlistStart = _clock.ToLocalUtc(playlistPayload.StartAtUnixMs!.Value);
+                    }
+
+                    var playlistStarted = _playerManager.PlayPlaylist(
+                        playlistPayload.Items,
+                        playlistPayload.Loop,
+                        playlistPayload.Volume,
+                        playlistStart);
+
+                    if (!playlistStarted)
+                    {
+                        status = "error";
+                        detail = "No se pudo reproducir la playlist (sin elementos válidos o LibVLC no disponible).";
+                        AgentLog.Error($"[PLAYLIST] {detail}");
+                        break;
+                    }
+
+                    var playlistDelay = playlistStart.HasValue
+                        ? Math.Clamp(
+                            (long)(playlistStart.Value - DateTime.UtcNow).TotalMilliseconds + 1500,
+                            1000,
+                            120000)
+                        : 1500;
+
+                    detail = playlistStart.HasValue
+                        ? $"Playlist '{playlistPayload.Name}' programada con {playlistPayload.Items.Count} elemento(s) " +
+                          $"para {playlistStart.Value:HH:mm:ss} UTC (offset de reloj {_clock.OffsetMs:0} ms)."
+                        : $"Playlist '{playlistPayload.Name}' iniciada con {playlistPayload.Items.Count} elemento(s).";
+
+                    AgentLog.Info($"[PLAYLIST] {detail}");
+
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay((int)playlistDelay);
                         await EmitThumbnailAsync(screenId);
                     });
                     break;
