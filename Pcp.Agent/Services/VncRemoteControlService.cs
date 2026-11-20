@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Net.WebSockets;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using Pcp.Agent.Logging;
 using Pcp.Shared.Dtos;
 
 namespace Pcp.Agent.Services;
@@ -23,6 +24,12 @@ public sealed class VncRemoteControlService : IDisposable
     private readonly ConcurrentDictionary<string, VncTunnel> _tunnels = new();
 
     private Func<VncTunnelStatusDto, Task>? _statusReporter;
+
+    /// <summary>
+    /// Control del kiosco. Mientras el túnel está abierto el reproductor se mantiene
+    /// minimizado para que el operador pueda navegar por el escritorio de Windows.
+    /// </summary>
+    public IKioskWindowController? Kiosk { get; set; }
 
     public VncRemoteControlService(
         VncServerManager vnc,
@@ -66,6 +73,10 @@ public sealed class VncRemoteControlService : IDisposable
             return;
         }
 
+        // Liberar el escritorio antes de arrancar TightVNC: cuando el operador se
+        // conecte, el kiosco ya está minimizado y sin TopMost.
+        SuspendKiosk();
+
         _ = Task.Run(() => RunAsync(request, tunnel));
     }
 
@@ -76,6 +87,32 @@ public sealed class VncRemoteControlService : IDisposable
         {
             _logger.LogInformation("Cerrando túnel VNC {SessionId} por orden del servidor", sessionId);
             tunnel.Cts.Cancel();
+        }
+    }
+
+    /// <summary>Pide al reproductor que suelte el escritorio mientras dure la sesión.</summary>
+    private void SuspendKiosk()
+    {
+        try
+        {
+            Kiosk?.Suspend(VlcPlayerManager.VncSuspendReason);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("No se pudo suspender el kiosco para el control remoto: {Message}", ex.Message);
+        }
+    }
+
+    /// <summary>Restaura el kiosco cuando el túnel ya no existe.</summary>
+    private void ResumeKiosk()
+    {
+        try
+        {
+            Kiosk?.Resume(VlcPlayerManager.VncSuspendReason);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("No se pudo restaurar el kiosco tras el control remoto: {Message}", ex.Message);
         }
     }
 
@@ -113,9 +150,7 @@ public sealed class VncRemoteControlService : IDisposable
                 Detail = "Túnel VNC activo."
             });
 
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [VNC] Sesión {request.SessionId} activa (127.0.0.1:{port})");
-            Console.ResetColor();
+            AgentLog.Info($"[VNC] Sesión {request.SessionId} activa (127.0.0.1:{port})");
 
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var wsToTcp = PumpWsToTcpAsync(socket, stream, linked.Token);
@@ -153,12 +188,14 @@ public sealed class VncRemoteControlService : IDisposable
                 await _vnc.StopAsync();
             }
 
+            // El kiosco solo se restaura cuando el túnel terminó de verdad (éxito,
+            // caída del socket o fallo de arranque de TightVNC).
+            ResumeKiosk();
+
             _tunnels.TryRemove(request.SessionId, out _);
             tunnel.Cts.Dispose();
 
-            Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [VNC] Sesión {request.SessionId} finalizada");
-            Console.ResetColor();
+            AgentLog.Info($"[VNC] Sesión {request.SessionId} finalizada");
         }
     }
 

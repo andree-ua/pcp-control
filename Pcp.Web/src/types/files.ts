@@ -21,3 +21,17 @@ export interface FileOperationResponse {
   success: boolean;
   savedPath?: string;
 }
+
+export type UploadPhase = "uploading" | "completed" | "failed";
+
+/** Progreso del tramo servidor → agente (evento SignalR FileUploadProgress). */
+export interface FileUploadProgress {
+  clientRequestId: string;
+  screenId: string;
+  fileName: string;
+  sentBytes: number;
+  totalBytes: number;
+  chunkIndex: number;
+  phase: UploadPhase;
+  error?: string | null;
+}

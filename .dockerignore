@@ -6,6 +6,7 @@
 **/.next/
 **/.next-*/
 **/publish/
+**/.build/
 **/pcp.db
 **/pcp.db-shm
 **/pcp.db-wal

@@ -24,6 +24,7 @@ public interface IFileRequestManager
         long totalBytes,
         Stream stream,
         TimeSpan timeout,
+        string? clientRequestId = null,
         CancellationToken cancellationToken = default);
 
     void Complete(FileResultDto result);
@@ -34,6 +35,7 @@ public interface IFileRequestManager
 public class FileRequestManager : IFileRequestManager
 {
     private const int UploadChunkBytes = 16 * 1024;
+    private const int ProgressThrottleMs = 250;
 
     private readonly IHubContext<ScreenHub> _hubContext;
     private readonly IScreenConnectionManager _connectionManager;
@@ -106,6 +108,7 @@ public class FileRequestManager : IFileRequestManager
         long totalBytes,
         Stream stream,
         TimeSpan timeout,
+        string? clientRequestId = null,
         CancellationToken cancellationToken = default)
     {
         var request = new FileRequestDto
@@ -127,6 +130,9 @@ public class FileRequestManager : IFileRequestManager
         var pending = new PendingRequest(screenId);
         _pending[request.RequestId] = pending;
         var proxy = _hubContext.Clients.Client(connectionId);
+        long sentBytes = 0;
+        var chunkIndex = 0;
+        var lastProgressAt = Environment.TickCount64;
 
         try
         {
@@ -135,11 +141,15 @@ public class FileRequestManager : IFileRequestManager
             // Si el agente rechazó el inicio (ruta inválida, archivo existente, etc.).
             if (pending.Completion.Task.IsCompleted)
             {
-                return await pending.Completion.Task;
+                var rejected = await pending.Completion.Task;
+                ReportProgress(clientRequestId, screenId, fileName, 0, totalBytes, 0,
+                    UploadPhases.Failed, rejected.Error);
+                return rejected;
             }
 
+            ReportProgress(clientRequestId, screenId, fileName, 0, totalBytes, 0, UploadPhases.Uploading);
+
             var buffer = new byte[UploadChunkBytes];
-            var chunkIndex = 0;
             int read;
 
             while ((read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)) > 0)
@@ -147,7 +157,10 @@ public class FileRequestManager : IFileRequestManager
                 if (pending.Completion.Task.IsCompleted)
                 {
                     await SendCancelAsync(proxy, request);
-                    return await pending.Completion.Task;
+                    var failed = await pending.Completion.Task;
+                    ReportProgress(clientRequestId, screenId, fileName, sentBytes, totalBytes, chunkIndex,
+                        UploadPhases.Failed, failed.Error);
+                    return failed;
                 }
 
                 var chunk = new FileRequestDto
@@ -160,7 +173,21 @@ public class FileRequestManager : IFileRequestManager
                 };
 
                 await proxy.SendAsync("FileRequest", chunk, cancellationToken);
+
+                sentBytes += read;
+
+                // Limitar a ~4 eventos/s: un archivo de 200 MB son >12.000 chunks.
+                var now = Environment.TickCount64;
+                if (now - lastProgressAt >= ProgressThrottleMs)
+                {
+                    lastProgressAt = now;
+                    ReportProgress(clientRequestId, screenId, fileName, sentBytes, totalBytes, chunkIndex,
+                        UploadPhases.Uploading);
+                }
             }
+
+            ReportProgress(clientRequestId, screenId, fileName, sentBytes, totalBytes, chunkIndex,
+                UploadPhases.Uploading);
 
             await proxy.SendAsync("FileRequest", new FileRequestDto
             {
@@ -171,21 +198,39 @@ public class FileRequestManager : IFileRequestManager
                 TotalBytes = totalBytes
             }, cancellationToken);
 
-            return await pending.Completion.Task.WaitAsync(timeout, cancellationToken);
+            var result = await pending.Completion.Task.WaitAsync(timeout, cancellationToken);
+
+            ReportProgress(
+                clientRequestId,
+                screenId,
+                fileName,
+                sentBytes,
+                totalBytes,
+                chunkIndex,
+                result.Success ? UploadPhases.Completed : UploadPhases.Failed,
+                result.Success ? null : result.Error);
+
+            return result;
         }
         catch (TimeoutException)
         {
             await SendCancelAsync(proxy, request);
+            ReportProgress(clientRequestId, screenId, fileName, sentBytes, totalBytes, chunkIndex,
+                UploadPhases.Failed, "El agente no confirmó la subida a tiempo.");
             return Failure(request, "El agente no confirmó la subida a tiempo.");
         }
         catch (OperationCanceledException)
         {
             await SendCancelAsync(proxy, request);
+            ReportProgress(clientRequestId, screenId, fileName, sentBytes, totalBytes, chunkIndex,
+                UploadPhases.Failed, "La subida fue cancelada.");
             return Failure(request, "La subida fue cancelada.");
         }
         catch (Exception ex)
         {
             await SendCancelAsync(proxy, request);
+            ReportProgress(clientRequestId, screenId, fileName, sentBytes, totalBytes, chunkIndex,
+                UploadPhases.Failed, ex.Message);
             _logger.LogWarning(ex, "Error al subir un archivo a la pantalla {ScreenId}", screenId);
             return Failure(request, $"Error al subir el archivo: {ex.Message}");
         }
@@ -193,6 +238,45 @@ public class FileRequestManager : IFileRequestManager
         {
             _pending.TryRemove(request.RequestId, out _);
         }
+    }
+
+    /// <summary>
+    /// Emite el progreso del tramo servidor → agente al grupo "panel". Es best-effort:
+    /// un fallo al notificar nunca debe romper la subida.
+    /// </summary>
+    private void ReportProgress(
+        string? clientRequestId,
+        string screenId,
+        string fileName,
+        long sentBytes,
+        long totalBytes,
+        int chunkIndex,
+        string phase,
+        string? error = null)
+    {
+        if (string.IsNullOrWhiteSpace(clientRequestId))
+        {
+            return;
+        }
+
+        var dto = new FileUploadProgressDto
+        {
+            ClientRequestId = clientRequestId,
+            ScreenId = screenId,
+            FileName = fileName,
+            SentBytes = sentBytes,
+            TotalBytes = totalBytes,
+            ChunkIndex = chunkIndex,
+            Phase = phase,
+            Error = error
+        };
+
+        _ = _hubContext.Clients.Group("panel")
+            .SendAsync(FileTransferEvents.UploadProgress, dto)
+            .ContinueWith(
+                task => _logger.LogDebug("No se pudo emitir el progreso de subida: {Message}",
+                    task.Exception?.Message),
+                TaskContinuationOptions.OnlyOnFaulted);
     }
 
     public void Complete(FileResultDto result)

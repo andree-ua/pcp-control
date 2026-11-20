@@ -84,6 +84,58 @@ public class FileRequestDto
 }
 
 /// <summary>
+/// Nombres de los eventos SignalR de transferencia de archivos.
+/// Mantener sincronizados con el panel web (src/types/files.ts).
+/// </summary>
+public static class FileTransferEvents
+{
+    /// <summary>Servidor → panel: progreso de una subida hacia el agente.</summary>
+    public const string UploadProgress = "FileUploadProgress";
+}
+
+/// <summary>Fases de una subida mostradas por el panel.</summary>
+public static class UploadPhases
+{
+    /// <summary>El servidor está enviando el archivo al agente por SignalR.</summary>
+    public const string Uploading = "uploading";
+
+    /// <summary>El agente confirmó el archivo.</summary>
+    public const string Completed = "completed";
+
+    /// <summary>La subida falló o fue cancelada.</summary>
+    public const string Failed = "failed";
+}
+
+/// <summary>
+/// Progreso real de una subida en el tramo servidor → agente. Se emite al grupo
+/// "panel" con el identificador que generó el navegador para que cada operador
+/// filtre solo su propia transferencia.
+/// </summary>
+public class FileUploadProgressDto
+{
+    /// <summary>Identificador generado por el panel para esta subida.</summary>
+    public string ClientRequestId { get; set; } = string.Empty;
+
+    public string ScreenId { get; set; } = string.Empty;
+
+    public string FileName { get; set; } = string.Empty;
+
+    /// <summary>Bytes ya entregados al agente (sin contar el chunk en vuelo).</summary>
+    public long SentBytes { get; set; }
+
+    public long TotalBytes { get; set; }
+
+    /// <summary>Índice del último chunk enviado.</summary>
+    public int ChunkIndex { get; set; }
+
+    /// <summary>Valor de <see cref="UploadPhases"/>.</summary>
+    public string Phase { get; set; } = UploadPhases.Uploading;
+
+    /// <summary>Motivo del fallo cuando <see cref="Phase"/> es "failed".</summary>
+    public string? Error { get; set; }
+}
+
+/// <summary>
 /// Respuesta del agente al servidor para una solicitud de archivos.
 /// </summary>
 public class FileResultDto

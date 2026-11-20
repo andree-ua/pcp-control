@@ -119,6 +119,7 @@ public class FilesController : ControllerBase
     public async Task<IActionResult> Upload(
         string screenId,
         [FromQuery] string? path,
+        [FromQuery] string? clientRequestId,
         [FromForm] IFormFile? file,
         CancellationToken cancellationToken)
     {
@@ -152,6 +153,7 @@ public class FilesController : ControllerBase
             file.Length,
             stream,
             TimeSpan.FromMinutes(5),
+            clientRequestId,
             cancellationToken);
 
         if (!result.Success)

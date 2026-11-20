@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Pcp.Agent.Logging;
 using Pcp.Shared.Dtos;
 
 namespace Pcp.Agent.Services;
@@ -38,6 +39,9 @@ public class AgentService : BackgroundService
         _systemCommands = systemCommands;
         _remoteControl = remoteControl;
         _playerManager = new VlcPlayerManager(config);
+
+        // El túnel VNC suspende el kiosco mientras el operador usa el escritorio.
+        _remoteControl.Kiosk = _playerManager;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -47,14 +51,12 @@ public class AgentService : BackgroundService
         var token = _config["Agent:Token"] ?? "dev-token";
         var serverUrl = _config["Agent:ServerUrl"] ?? "http://localhost:5000";
 
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("==================================================");
-        Console.WriteLine($"   PCP AGENT - PANTALLA: {screenId} ({screenName})");
-        Console.WriteLine($"   Servidor: {serverUrl}");
-        Console.WriteLine($"   Reproductor Kiosco: LibVLC (Hardware Acceleration)");
-        Console.WriteLine($"   Control remoto VNC: {(_remoteControl.IsAvailable ? "disponible" : "NO disponible")}");
-        Console.WriteLine("==================================================");
-        Console.ResetColor();
+        AgentLog.Info("==================================================");
+        AgentLog.Info($"   PCP AGENT - PANTALLA: {screenId} ({screenName})");
+        AgentLog.Info($"   Servidor: {serverUrl}");
+        AgentLog.Info($"   Reproductor Kiosco: LibVLC (Hardware Acceleration)");
+        AgentLog.Info($"   Control remoto VNC: {(_remoteControl.IsAvailable ? "disponible" : "NO disponible")}");
+        AgentLog.Info("==================================================");
 
         // 1. Intentar pre-registro REST en el servidor
         await TryRegisterRestAsync(serverUrl, screenId, screenName, token, stoppingToken);
@@ -77,25 +79,19 @@ public class AgentService : BackgroundService
         // 3. Suscripción a eventos de ciclo de vida de la conexión
         _hubConnection.Reconnecting += error =>
         {
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [ALERTA] Conexión perdida con el servidor. Reconectando... ({error?.Message})");
-            Console.ResetColor();
+            AgentLog.Warn($"[ALERTA] Conexión perdida con el servidor. Reconectando... ({error?.Message})");
             return Task.CompletedTask;
         };
 
         _hubConnection.Reconnected += connectionId =>
         {
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [CONECTADO] Reconexión exitosa al Hub. Nuevo ConnectionId: {connectionId}");
-            Console.ResetColor();
+            AgentLog.Info($"[CONECTADO] Reconexión exitosa al Hub. Nuevo ConnectionId: {connectionId}");
             return Task.CompletedTask;
         };
 
         _hubConnection.Closed += error =>
         {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [ERROR] Conexión cerrada. {error?.Message}");
-            Console.ResetColor();
+            AgentLog.Error($"[ERROR] Conexión cerrada. {error?.Message}");
             return Task.CompletedTask;
         };
 
@@ -122,9 +118,7 @@ public class AgentService : BackgroundService
 
         _hubConnection.On<VncTunnelRequestDto>(RemoteControlEvents.OpenTunnel, request =>
         {
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [VNC] Petición de control remoto recibida (sesión {request.SessionId})");
-            Console.ResetColor();
+            AgentLog.Info($"[VNC] Petición de control remoto recibida (sesión {request.SessionId})");
             _remoteControl.Start(request);
         });
 
@@ -249,12 +243,10 @@ public class AgentService : BackgroundService
             try
             {
                 attempt++;
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Conectando al Hub SignalR (intento #{attempt})...");
+                AgentLog.Info($"Conectando al Hub SignalR (intento #{attempt})...");
                 await _hubConnection!.StartAsync(ct);
 
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [CONECTADO] Conectado exitosamente al servidor SignalR.");
-                Console.ResetColor();
+                AgentLog.Info($"[CONECTADO] Conectado exitosamente al servidor SignalR.");
 
                 // Enviar inmediatamente un thumbnail inicial
                 await EmitThumbnailAsync(_config["Agent:ScreenId"] ?? "screen-01");
@@ -262,9 +254,7 @@ public class AgentService : BackgroundService
             }
             catch (Exception ex)
             {
-                Console.ForegroundColor = ConsoleColor.DarkYellow;
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Servidor aún no disponible ({ex.Message}). Reintentando en 3s...");
-                Console.ResetColor();
+                AgentLog.Warn($"Servidor aún no disponible ({ex.Message}). Reintentando en 3s...");
 
                 try
                 {
@@ -298,16 +288,12 @@ public class AgentService : BackgroundService
                 };
 
                 await _hubConnection.InvokeAsync("SendThumbnail", dto);
-                Console.ForegroundColor = ConsoleColor.DarkGray;
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [THUMBNAIL] Miniatura transmitida ({thumbnailBase64.Length} chars)");
-                Console.ResetColor();
+                AgentLog.Info($"[THUMBNAIL] Miniatura transmitida ({thumbnailBase64.Length} chars)");
             }
         }
         catch (Exception ex)
         {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"[THUMBNAIL ERROR] {ex.Message}");
-            Console.ResetColor();
+            AgentLog.Error($"[THUMBNAIL ERROR] {ex.Message}");
         }
     }
 
@@ -341,9 +327,7 @@ public class AgentService : BackgroundService
         try
         {
             await _hubConnection.InvokeAsync("Heartbeat", heartbeat);
-            Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [HEARTBEAT] Enviado: Media='{currentMedia}', Vol={volume}%, CPU={cpu:F1}%, RAM={ram:F1}%, Disco={freeDiskMb}MB");
-            Console.ResetColor();
+            AgentLog.Info($"[HEARTBEAT] Enviado: Media='{currentMedia}', Vol={volume}%, CPU={cpu:F1}%, RAM={ram:F1}%, Disco={freeDiskMb}MB");
         }
         catch (Exception ex)
         {
@@ -462,9 +446,7 @@ public class AgentService : BackgroundService
         try
         {
             await _hubConnection.InvokeAsync("FileResult", result);
-            Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [FILES] {request.Operation}: {(result.Success ? "OK" : result.Error)}");
-            Console.ResetColor();
+            AgentLog.Info($"[FILES] {request.Operation}: {(result.Success ? "OK" : result.Error)}");
         }
         catch (Exception ex)
         {
@@ -477,11 +459,9 @@ public class AgentService : BackgroundService
     /// </summary>
     private async Task ProcessCommandAsync(CommandDto command, string screenId)
     {
-        Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine($"\n==================================================");
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ▶ COMANDO RECIBIDO: {command.Type.ToUpper()} (ID: {command.CommandId})");
-        Console.WriteLine($"==================================================");
-        Console.ResetColor();
+        AgentLog.Info($"\n==================================================");
+        AgentLog.Info($"▶ COMANDO RECIBIDO: {command.Type.ToUpper()} (ID: {command.CommandId})");
+        AgentLog.Info($"==================================================");
 
         string status = "ok";
         string detail = string.Empty;
@@ -512,10 +492,8 @@ public class AgentService : BackgroundService
                     // Reproducir con LibVLC
                     _playerManager.Play(mediaPath, loop, volume);
 
-                    Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine($"▶ [PLAY VLC] Reproduciendo: {mediaPath}");
-                    Console.WriteLine($"   Loop: {loop} | Volumen: {volume}% | Kiosk Mode");
-                    Console.ResetColor();
+                    AgentLog.Info($"▶ [PLAY VLC] Reproduciendo: {mediaPath}");
+                    AgentLog.Info($"   Loop: {loop} | Volumen: {volume}% | Kiosk Mode");
 
                     detail = $"Reproduciendo medio con LibVLC: {mediaPath}";
 
@@ -529,17 +507,13 @@ public class AgentService : BackgroundService
 
                 case "pause":
                     _playerManager.Pause();
-                    Console.ForegroundColor = ConsoleColor.Cyan;
-                    Console.WriteLine($"⏸ [PAUSE VLC] Reproducción alternada en: {_playerManager.CurrentMedia}");
-                    Console.ResetColor();
+                    AgentLog.Info($"⏸ [PAUSE VLC] Reproducción alternada en: {_playerManager.CurrentMedia}");
                     detail = $"Reproducción pausada/reanudada en: {_playerManager.CurrentMedia}";
                     break;
 
                 case "stop":
                     _playerManager.Stop();
-                    Console.ForegroundColor = ConsoleColor.Magenta;
-                    Console.WriteLine($"⏹ [STOP VLC] Reproducción detenida. Estado cambiado a reposo (idle).");
-                    Console.ResetColor();
+                    AgentLog.Info($"⏹ [STOP VLC] Reproducción detenida. Estado cambiado a reposo (idle).");
                     detail = "Reproducción detenida.";
 
                     // Emitir inmediatamente miniatura de reposo
@@ -566,9 +540,7 @@ public class AgentService : BackgroundService
                     }
 
                     _playerManager.SetVolume(newVol);
-                    Console.ForegroundColor = ConsoleColor.Cyan;
-                    Console.WriteLine($"🔊 [VOLUME VLC] Volumen ajustado a: {newVol}%");
-                    Console.ResetColor();
+                    AgentLog.Info($"🔊 [VOLUME VLC] Volumen ajustado a: {newVol}%");
                     detail = $"Volumen ajustado a {newVol}%";
                     break;
 
@@ -599,12 +571,30 @@ public class AgentService : BackgroundService
                     detail = lockResult.Detail;
                     break;
 
+                case "kiosk-pause":
+                case "kiosk_pause":
+                case "pause_kiosk":
+                case "pausekiosk":
+                    _playerManager.Suspend(VlcPlayerManager.ManualSuspendReason);
+                    AgentLog.Info("🖥 [KIOSK] Kiosco suspendido manualmente: escritorio libre.");
+                    detail = "Kiosco suspendido: el reproductor queda minimizado y sin TopMost.";
+                    break;
+
+                case "kiosk-resume":
+                case "kiosk_resume":
+                case "resume_kiosk":
+                case "resumekiosk":
+                    _playerManager.Resume(VlcPlayerManager.ManualSuspendReason);
+                    AgentLog.Info("🖥 [KIOSK] Kiosco reanudado manualmente.");
+                    detail = _playerManager.HasMedia
+                        ? "Kiosco reanudado: el vídeo vuelve a pantalla completa."
+                        : "Kiosco reanudado en reposo.";
+                    break;
+
                 default:
                     status = "error";
                     detail = $"Comando no reconocido o no soportado: '{command.Type}'";
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"✖ [ERROR] {detail}");
-                    Console.ResetColor();
+                    AgentLog.Error($"✖ [ERROR] {detail}");
                     break;
             }
         }
@@ -612,9 +602,7 @@ public class AgentService : BackgroundService
         {
             status = "error";
             detail = $"Excepción al ejecutar comando: {ex.Message}";
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"✖ [EXCEPCIÓN] {detail}");
-            Console.ResetColor();
+            AgentLog.Error($"✖ [EXCEPCIÓN] {detail}");
         }
 
         // Devolver respuesta con CommandResultDto
@@ -632,9 +620,7 @@ public class AgentService : BackgroundService
             try
             {
                 await _hubConnection.InvokeAsync("CommandResult", resultDto);
-                Console.ForegroundColor = ConsoleColor.DarkGreen;
-                Console.WriteLine($"✓ [CONFIRMACIÓN] Resultado reportado al servidor: Status='{status}', Detalle='{detail}'\n");
-                Console.ResetColor();
+                AgentLog.Info($"✓ [CONFIRMACIÓN] Resultado reportado al servidor: Status='{status}', Detalle='{detail}'\n");
             }
             catch (Exception ex)
             {

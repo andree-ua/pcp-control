@@ -270,3 +270,48 @@ $env:PCP_TOKEN="token-real"
 
 LibVLC y sus plugins se extraen a un directorio temporal al arrancar; si fallan, el agente
 continúa en modo simulado. Pendiente de validación final en un stick real.
+
+El agente es un `WinExe` (no abre consola): toda la actividad se escribe en
+`C:\ProgramData\PcpAgent\agent.log` (rotación 5 MB × 3, configurable con `Agent:LogPath`).
+En desarrollo, `dotnet run` tampoco imprime en consola: sigue el archivo con `Get-Content -Wait`.
+
+### 4. Instalación zero-touch en decenas de PCs
+
+`publish-agent.ps1` genera `publish/PcpAgent.zip` (~200 MB) con el agente, el instalador y la
+plantilla de configuración. El MSI de TightVNC se copia desde `deploy/tightvnc.msi` si existe.
+
+En cada stick:
+
+1. Descomprimir el ZIP (debe contener `Pcp.Agent.exe`, `watchdog.vbs`, `install.bat`, `install.ps1` y, opcionalmente, `tightvnc.msi`).
+2. Ejecutar como administrador:
+
+```bat
+install.bat PC-SALA-01
+install.bat PC-SALA-01 https://pcp-control.onrender.com
+install.bat PC-SALA-01 https://pcp-control.onrender.com token-unico
+install.bat PC-SALA-01 https://pcp-control.onrender.com token-unico -EnableAutoLogon .\kiosco MiClave123
+```
+
+El instalador:
+
+- Instala TightVNC en silencio (`msiexec /qn /norestart`).
+- Detiene y deshabilita el servicio TightVNC para que el agente use el modo aplicación en la sesión interactiva, y elimina la marca `ServiceOnly`.
+- Copia el agente y `watchdog.vbs` a `C:\Program Files\PcpAgent\` y genera `appsettings.json`.
+- Crea la tarea programada `PcpAgent` al iniciar sesión, en la sesión interactiva del usuario actual y con privilegios elevados.
+- Crea la tarea `PcpAgentWatchdog`, que reinicia el agente en 10 s si se cierra o falla (log en `C:\ProgramData\PcpAgent\watchdog.log`).
+- Con `-EnableAutoLogon` configura el auto-logon de Windows para que el kiosco arranque al encender la PC (la contraseña queda en el registro; usa un usuario kiosco dedicado).
+- Concede permisos de escritura al grupo Usuarios en `C:\ProgramData\PcpAgent` para los logs del agente.
+- Arranca el agente y deja el log de instalación en `C:\ProgramData\PcpAgent\install.log`.
+
+La configuración efectiva prioriza el entorno sobre el JSON:
+
+```
+appsettings.json < variables estándar < PCP_* < PCP_SERVER_URL/PCP_SCREEN_ID/PCP_TOKEN
+```
+
+El arranque muestra `[CONFIG] ScreenId=... ServerUrl=... Origen=...` para diagnosticar instalaciones
+masivas. Para reconfigurar por RMM sin tocar archivos, ejecutar `install.ps1 ... -UseMachineEnvironment`.
+
+Desinstalación: `powershell -ExecutionPolicy Bypass -File uninstall.ps1` (detiene y elimina ambas
+tareas, mata el watchdog y borra la carpeta; no desinstala TightVNC). Añade `-ClearAutoLogon` si el
+instalador había habilitado el auto-logon.

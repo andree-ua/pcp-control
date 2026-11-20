@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import {
   AlertTriangle,
   ChevronLeft,
@@ -17,7 +17,8 @@ import {
   X,
 } from "lucide-react";
 import { FileEntry, FileListing } from "@/types/files";
-import { deleteFile, fetchFiles, sendScreenCommand, uploadFile } from "@/services/api";
+import { deleteFile, fetchFiles, sendScreenCommand, uploadFileWithProgress } from "@/services/api";
+import { subscribeUploadProgress } from "@/services/uploadProgress";
 
 interface FileExplorerModalProps {
   open: boolean;
@@ -40,6 +41,18 @@ function formatDate(value: string): string {
   return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
 }
 
+type UploadStage = "sending" | "delivering" | "verifying";
+
+interface UploadState {
+  fileName: string;
+  index: number;
+  count: number;
+  loaded: number;
+  total: number;
+  stage: UploadStage;
+  rateBytesPerSecond: number;
+}
+
 export function FileExplorerModal({
   open,
   screenId,
@@ -53,9 +66,12 @@ export function FileExplorerModal({
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState("");
+  const [uploadState, setUploadState] = useState<UploadState | null>(null);
+  const [dragActive, setDragActive] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const uploadAbortRef = useRef<AbortController | null>(null);
+  const dragDepthRef = useRef(0);
   const onCloseRef = useRef(onClose);
   const onSuccessRef = useRef(onSuccess);
   const onErrorRef = useRef(onError);
@@ -104,6 +120,14 @@ export function FileExplorerModal({
 
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
+  }, [open]);
+
+  // Cerrar el modal cancela la subida en curso (el servidor avisa al agente y este
+  // elimina el archivo temporal).
+  useEffect(() => {
+    if (!open) {
+      uploadAbortRef.current?.abort();
+    }
   }, [open]);
 
   if (!open) {
@@ -170,38 +194,188 @@ export function FileExplorerModal({
     }
   };
 
-  const handleUploadSelected = async (event: ChangeEvent<HTMLInputElement>) => {
+  const uploadFiles = useCallback(
+    async (files: File[]) => {
+      const folder = listing?.path?.trim() ? listing.path : null;
+      if (!folder || files.length === 0 || uploading) {
+        return;
+      }
+
+      // Un directorio arrastrado llega como File de tamaño 0 y sin tipo.
+      const valid = files.filter((file) => file.size > 0);
+      if (valid.length === 0) {
+        const message = "No se admiten carpetas: arrastra archivos, no directorios.";
+        setActionError(message);
+        onErrorRef.current("Subir archivo", message);
+        return;
+      }
+
+      setUploading(true);
+      setActionError(null);
+
+      const controller = new AbortController();
+      uploadAbortRef.current = controller;
+
+      try {
+        for (let index = 0; index < valid.length; index += 1) {
+          if (controller.signal.aborted) {
+            throw new DOMException("Subida cancelada por el operador.", "AbortError");
+          }
+
+          const file = valid[index];
+          const startedAt = Date.now();
+          const baseState: UploadState = {
+            fileName: file.name,
+            index: index + 1,
+            count: valid.length,
+            loaded: 0,
+            total: file.size,
+            stage: "sending",
+            rateBytesPerSecond: 0,
+          };
+          setUploadState(baseState);
+
+          const handle = uploadFileWithProgress(screenId, folder, file, {
+            signal: controller.signal,
+            onBrowserProgress: (loaded, total) => {
+              const elapsedSeconds = Math.max(0.001, (Date.now() - startedAt) / 1000);
+              const effectiveTotal = total || file.size;
+              setUploadState({
+                ...baseState,
+                loaded,
+                total: effectiveTotal,
+                stage: loaded >= effectiveTotal ? "delivering" : "sending",
+                rateBytesPerSecond: loaded / elapsedSeconds,
+              });
+            },
+          });
+
+          // Tramo servidor -> agente: el servidor etiqueta cada evento con el id de esta subida.
+          const unsubscribe = subscribeUploadProgress(handle.clientRequestId, (event) => {
+            if (event.phase !== "uploading") {
+              return;
+            }
+
+            setUploadState({
+              ...baseState,
+              loaded: event.sentBytes,
+              total: event.totalBytes || file.size,
+              stage: "delivering",
+              rateBytesPerSecond: 0,
+            });
+          });
+
+          try {
+            await handle.promise;
+            setUploadState((prev) =>
+              prev ? { ...prev, loaded: prev.total, stage: "verifying", rateBytesPerSecond: 0 } : prev
+            );
+          } finally {
+            unsubscribe();
+          }
+        }
+
+        onSuccessRef.current(
+          "Archivos subidos",
+          `${valid.length} archivo(s) subido(s) a la carpeta actual.`
+        );
+        await load(folder);
+      } catch (err: unknown) {
+        const aborted = err instanceof DOMException && err.name === "AbortError";
+        const message = aborted
+          ? "Subida cancelada por el operador."
+          : err instanceof Error
+            ? err.message
+            : "No se pudo subir el archivo";
+
+        if (aborted) {
+          onSuccessRef.current("Subida cancelada", message);
+        } else {
+          setActionError(message);
+          onErrorRef.current("Subir archivo", message);
+        }
+
+        await load(folder);
+      } finally {
+        uploadAbortRef.current = null;
+        setUploading(false);
+        setUploadState(null);
+      }
+    },
+    [screenId, listing, uploading, load]
+  );
+
+  const handleUploadSelected = (event: ChangeEvent<HTMLInputElement>) => {
     const selected = Array.from(event.target.files ?? []);
     event.target.value = "";
+    void uploadFiles(selected);
+  };
 
-    if (selected.length === 0 || !currentPath) {
+  const cancelUpload = () => {
+    uploadAbortRef.current?.abort();
+  };
+
+  const canDrop = Boolean(currentPath) && !isBusy && !loading;
+
+  const handleDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    if (!canDrop) return;
+    dragDepthRef.current += 1;
+    setDragActive(true);
+  };
+
+  const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = canDrop ? "copy" : "none";
+  };
+
+  const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    if (!canDrop) return;
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) {
+      setDragActive(false);
+    }
+  };
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setDragActive(false);
+
+    if (!currentPath) {
+      const message = "Selecciona una carpeta (una unidad) antes de arrastrar archivos.";
+      setActionError(message);
+      onErrorRef.current("Subir archivo", message);
       return;
     }
 
-    setUploading(true);
-    setActionError(null);
-
-    try {
-      for (let index = 0; index < selected.length; index += 1) {
-        setUploadProgress(`${index + 1}/${selected.length}`);
-        await uploadFile(screenId, currentPath, selected[index]);
-      }
-
-      onSuccessRef.current(
-        "Archivos subidos",
-        `${selected.length} archivo(s) subido(s) a la carpeta actual.`
-      );
-      await load(currentPath);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "No se pudo subir el archivo";
-      setActionError(message);
-      onErrorRef.current("Subir archivo", message);
-      await load(currentPath);
-    } finally {
-      setUploading(false);
-      setUploadProgress("");
+    if (isBusy) {
+      return;
     }
+
+    void uploadFiles(Array.from(event.dataTransfer.files));
   };
+
+  const uploadPercent =
+    uploadState && uploadState.total > 0
+      ? Math.min(100, Math.round((uploadState.loaded / uploadState.total) * 100))
+      : 0;
+
+  const uploadStageLabel =
+    uploadState?.stage === "sending"
+      ? "Enviando al servidor..."
+      : uploadState?.stage === "delivering"
+        ? "Entregando al agente..."
+        : "Verificando en el agente...";
+
+  const uploadEtaSeconds =
+    uploadState && uploadState.stage === "sending" && uploadState.rateBytesPerSecond > 0
+      ? Math.max(
+          1,
+          Math.ceil((uploadState.total - uploadState.loaded) / uploadState.rateBytesPerSecond)
+        )
+      : null;
 
   return (
     <div
@@ -305,9 +479,53 @@ export function FileExplorerModal({
             ) : (
               <Upload className="w-3.5 h-3.5" />
             )}
-            <span>{uploading ? `Subiendo ${uploadProgress}` : "Subir"}</span>
+            <span>{uploading ? "Subiendo..." : "Subir"}</span>
           </button>
         </div>
+
+        {/* Progreso real de la subida (navegador -> servidor -> agente) */}
+        {uploading && uploadState && (
+          <div className="px-5 py-3 border-b border-zinc-800 bg-zinc-950/50">
+            <div className="flex items-center justify-between gap-3 text-xs">
+              <span className="truncate font-medium text-zinc-200" title={uploadState.fileName}>
+                {uploadState.index}/{uploadState.count} · {uploadState.fileName}
+              </span>
+              <span className="flex items-center gap-2 flex-shrink-0">
+                <span className="font-mono text-indigo-300">{uploadPercent}%</span>
+                <button
+                  type="button"
+                  onClick={cancelUpload}
+                  className="px-2 py-0.5 rounded-md bg-zinc-800 hover:bg-rose-600 text-zinc-300 hover:text-white text-[10px] font-medium transition-colors"
+                  title="Cancelar la subida en curso"
+                >
+                  Cancelar
+                </button>
+              </span>
+            </div>
+
+            <div className="mt-2 h-1.5 rounded-full bg-zinc-800 overflow-hidden">
+              <div
+                className={`h-full rounded-full bg-indigo-500 transition-[width] duration-200 ${
+                  uploadState.stage === "verifying" ? "animate-pulse" : ""
+                }`}
+                style={{ width: `${Math.max(2, uploadPercent)}%` }}
+              />
+            </div>
+
+            <div className="mt-1.5 flex items-center justify-between gap-3 text-[11px] text-zinc-500">
+              <span className="truncate">{uploadStageLabel}</span>
+              <span className="flex items-center gap-2 whitespace-nowrap">
+                <span className="font-mono">
+                  {formatSize(uploadState.loaded)} / {formatSize(uploadState.total)}
+                </span>
+                {uploadState.stage === "sending" && uploadState.rateBytesPerSecond > 0 && (
+                  <span className="font-mono">{formatSize(uploadState.rateBytesPerSecond)}/s</span>
+                )}
+                {uploadEtaSeconds !== null && <span className="font-mono">~{uploadEtaSeconds}s</span>}
+              </span>
+            </div>
+          </div>
+        )}
 
         {/* Error */}
         {actionError && (
@@ -317,8 +535,25 @@ export function FileExplorerModal({
           </div>
         )}
 
-        {/* Contenido */}
-        <div className="flex-1 overflow-auto min-h-[240px]">
+        {/* Contenido (zona de arrastrar y soltar) */}
+        <div
+          className="relative flex-1 min-h-0 flex flex-col"
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
+          {dragActive && canDrop && (
+            <div className="absolute inset-2 z-20 flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-indigo-400 bg-indigo-950/85 text-center pointer-events-none backdrop-blur-sm">
+              <Upload className="w-8 h-8 text-indigo-300" />
+              <p className="text-sm font-semibold text-indigo-100">Suelta los archivos para subirlos</p>
+              <p className="max-w-[85%] truncate font-mono text-[11px] text-indigo-300/80">
+                {currentPath}
+              </p>
+            </div>
+          )}
+
+          <div className="flex-1 overflow-auto min-h-[240px]">
           {loading && !listing ? (
             <div className="h-full min-h-[240px] flex flex-col items-center justify-center text-zinc-400 gap-3">
               <Loader2 className="w-7 h-7 animate-spin text-indigo-500" />
@@ -433,6 +668,7 @@ export function FileExplorerModal({
               </tbody>
             </table>
           )}
+          </div>
         </div>
 
         {/* Pie */}
@@ -441,6 +677,7 @@ export function FileExplorerModal({
             {atRoots
               ? `${listing?.roots.length ?? 0} unidad(es)`
               : `${entries.length} elemento(s)`}
+            {!atRoots && !uploading ? " · arrastra archivos aquí" : ""}
             {listing?.truncated ? " · lista truncada" : ""}
           </span>
           <span className="font-mono truncate max-w-[60%]" title={currentPath ?? ""}>

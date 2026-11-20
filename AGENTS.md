@@ -46,7 +46,11 @@ C:\Proyectos\Pcp\
 │     ├─ FileDtos.cs          ← contratos del explorador de archivos (list/delete/upload)
 │     ├─ GroupDtos.cs         ← grupos y respuestas de comandos masivos
 │     └─ RemoteControlDtos.cs ← sesiones VNC (petición de túnel, estado, respuesta REST)
-├─ scripts\publish-agent.ps1  ← publish single-file self-contained del agente
+├─ scripts\publish-agent.ps1  ← publish single-file + ZIP de despliegue
+├─ deploy\                    ← instalador zero-touch para los sticks
+│  ├─ install.bat / install.ps1 ← TightVNC + copia + tarea programada
+│  ├─ uninstall.ps1
+│  └─ appsettings.template.json
 ├─ .env.example               ← variables de producción (servidor/agente)
 ├─ .config\dotnet-tools.json  ← dotnet-ef 8.0.34 fijado
 ├─ Pcp.Server\                ← ASP.NET Core 8 + SignalR + EF Core (MySQL prod / SQLite dev)
@@ -70,15 +74,16 @@ C:\Proyectos\Pcp\
 │  ├─ appsettings.Production.json ← proveedor MySQL y CORS por entorno
 │  ├─ Properties\launchSettings.json  ← http://localhost:5000
 │  └─ pcp.db (+ -shm/-wal)    ← BD SQLite local (solo desarrollo, NO versionar)
-├─ Pcp.Agent\                 ← consola net8.0-windows, WinForms + LibVLC
-│  ├─ Program.cs              ← Host genérico, registra AgentService y FileService
+├─ Pcp.Agent\                 ← WinExe net8.0-windows (sin consola), WinForms + LibVLC
+│  ├─ Program.cs              ← Host genérico, logging a archivo, instancia única y DI
+│  ├─ Logging\AgentLog.cs     ← log rotativo en C:\ProgramData\PcpAgent\agent.log + ILoggerProvider
 │  ├─ Services\AgentService.cs        ← SignalR, heartbeat, thumbnails, comandos, archivos
 │  ├─ Services\FileService.cs         ← listar/borrar/subir con validación de rutas
 │  ├─ Services\SystemCommandService.cs ← apagado, reinicio, monitor y bloqueo
 │  ├─ Services\VncServerManager.cs    ← detecta/aprovisiona y arranca TightVNC local
 │  ├─ Services\VncRemoteControlService.cs ← túnel WebSocket saliente hacia el servidor
 │  ├─ Services\VlcPlayerManager.cs    ← ventana kiosco + LibVLC + captura
-│  └─ appsettings.json        ← opcional; se puede sustituir por variables de entorno
+│  └─ appsettings.json        ← opcional; las variables PCP_* tienen prioridad
 └─ Pcp.Web\                   ← Next.js 14 App Router + Tailwind + SignalR client
    ├─ src\app\page.tsx        ← dashboard de pantallas
    ├─ src\app\groups\page.tsx ← sección de grupos y control masivo
@@ -135,7 +140,7 @@ Reglas del comando:
 |---|---|---|
 | GET | `/api/screens/{id}/files?path=` | Sin `path` devuelve las unidades permitidas; con `path` lista carpetas/archivos. Delegado al agente. |
 | DELETE | `/api/screens/{id}/files?path=...` | Elimina **solo archivos** (nunca carpetas). |
-| POST | `/api/screens/{id}/files/upload?path=...` | Sube un archivo multipart a la carpeta indicada. Rechaza sobrescrituras. |
+| POST | `/api/screens/{id}/files/upload?path=...&clientRequestId=...` | Sube un archivo multipart a la carpeta indicada. Rechaza sobrescrituras. `clientRequestId` es opcional y sirve para etiquetar los eventos `FileUploadProgress` del tramo servidor → agente. |
 
 Reglas de archivos:
 - La pantalla debe existir y estar conectada; en caso contrario 404/400.
@@ -208,7 +213,7 @@ Reglas del control remoto:
 
 **Eventos servidor → panel** (nombres exactos, usados por el frontend):
 `ScreenStatusChanged(screenId, status)`, `HeartbeatReceived(screenInfo)`,
-`ThumbnailReceived(dto)`, `CommandResultReceived(dto)`.
+`ThumbnailReceived(dto)`, `CommandResultReceived(dto)`, `FileUploadProgress(dto)`.
 **Evento servidor → agente**: `SendCommandToAgent(commandDto)`, `FileRequest(fileRequestDto)`,
 `OpenVncTunnel(vncTunnelRequestDto)` y `CloseVncTunnel(sessionId)`.
 **Evento agente → servidor**: `FileResult(fileResultDto)`, `VncTunnelStatus(statusDto)`.
@@ -229,6 +234,7 @@ Reglas del control remoto:
 ## 4. Pcp.Agent en detalle
 
 ### Ciclo de vida (`AgentService.ExecuteAsync`)
+0. `Program.cs` (WinExe, sin consola) inicializa `AgentLog` en `C:\ProgramData\PcpAgent\agent.log`, redirige `Console.*` al archivo, registra solo el proveedor de archivo para `ILogger` y toma el mutex `Local\PcpAgent-{screenId}` (segunda instancia → termina).
 1. Lee config `Agent:*` (defaults: `screen-01`, `Pantalla screen-01`, `dev-token`, `http://localhost:5000`) desde `appsettings.json` junto al `.exe` (opcional), variables estándar (`Agent__ServerUrl`), prefijo `PCP_` (`PCP_Agent__ServerUrl`) o atajos `PCP_SERVER_URL` / `PCP_SCREEN_ID` / `PCP_SCREEN_NAME` / `PCP_TOKEN`.
 2. `POST /api/screens/register` hasta 3 intentos (timeout 5 s); si falla, continúa.
 3. Construye URL del Hub con `screenId` y `token` en query y `WithAutomaticReconnect` (0, 2, 5, 10, 20 s).
@@ -244,6 +250,21 @@ Reglas del control remoto:
 - El directorio de configuración se resuelve con `Environment.ProcessPath`, no con `AppContext.BaseDirectory`: en un single-file con extracción, `AppContext.BaseDirectory` apunta a `%TEMP%\.net\...`, mientras que el `.exe` está en la carpeta de instalación.
 - LibVLC y sus plugins se extraen a un directorio temporal al arrancar; el modo degradado sigue activo si fallan. Falta validarlo en un stick real.
 - Los archivos publicados no se versionan (`publish/`).
+- `publish-agent.ps1` usa una salida intermedia aislada (`.build/agent/bin`) para no chocar con un agente en ejecución que bloquee `bin/Release`.
+- El script copia `deploy/install.*`, `deploy/watchdog.vbs`, `deploy/appsettings.template.json` y, si existe, `deploy/tightvnc.msi`; al final genera `publish/PcpAgent.zip` (~200 MB).
+
+### Instalación zero-touch (`deploy/`)
+- `install.bat <ID-PANTALLA> [URL] [TOKEN] [-EnableAutoLogon USUARIO CONTRASENA]` solicita elevación y ejecuta `install.ps1`.
+- `install.ps1` valida el ID, instala `tightvnc.msi` con `msiexec /qn /norestart`, detiene y deshabilita el servicio TightVNC (el MSI lo deja en sesión 0, incompatible con el kiosco), elimina `HKLM\Software\TightVNC\Server\ServiceOnly` en las vistas 64/32 y verifica `tvnserver.exe`.
+- Copia `Pcp.Agent.exe`, `watchdog.vbs` + `appsettings.json` generado desde la plantilla a `C:\Program Files\PcpAgent` y registra la tarea `PcpAgent` con disparador `AtLogOn`, principal `Interactive` y `RunLevel Highest`. **No** usa “Run whether user is logged on or not”: esa opción ejecuta en sesión 0 y rompería LibVLC, TightVNC y el bloqueo de sesión.
+- **Watchdog**: tarea `PcpAgentWatchdog` (también interactiva) que lanza `wscript.exe //B watchdog.vbs`. El script residente (sin ventana) comprueba `Pcp.Agent.exe` cada **10 s** y lo relanza si se cerró o falló; los reinicios van a `C:\ProgramData\PcpAgent\watchdog.log`. Se detiene con el flag `watchdog.stop` durante instalación/desinstalación. El Programador de tareas añade además reintento nativo (≈1 min) como red de seguridad.
+- **Arranque al encender**: `-EnableAutoLogon` escribe `Winlogon\AutoAdminLogon`, `DefaultUserName`, `DefaultDomainName` y `DefaultPassword` para que Windows inicie sesión solo y dispare las tareas interactivas. Requiere usuario kiosco dedicado; la contraseña queda en texto claro en el registro (el instalador lo advierte). Sin este flag, el kiosco arranca cuando un usuario inicia sesión.
+- **Instancia única**: `Program.cs` crea un mutex `Local\PcpAgent-{screenId}`; si el logon y el watchdog arrancan a la vez, la segunda instancia termina. Se conserva la simulación de varias pantallas en un mismo equipo.
+- **Logs**: el agente es `WinExe` y escribe `C:\ProgramData\PcpAgent\agent.log` (rotación 5 MB × 3, configurable con `Agent:LogPath`). `install.ps1` concede Modify al grupo Usuarios en esa carpeta para que el agente, que corre sin elevar, pueda escribir.
+- Configuración efectiva: `appsettings.json` < variables estándar < `PCP_*` < atajos `PCP_SERVER_URL`/`PCP_SCREEN_ID`/`PCP_TOKEN` < CLI. El arranque registra `[CONFIG] ScreenId=... ServerUrl=... Origen=... Log=...`.
+- `-UseMachineEnvironment` define además `PCP_SERVER_URL`, `PCP_SCREEN_ID`, `PCP_SCREEN_NAME` y `PCP_TOKEN` a nivel de máquina para reconfiguración remota.
+- Log de instalación: `C:\ProgramData\PcpAgent\install.log`; log del MSI: `tightvnc-msi.log`.
+- `uninstall.ps1` detiene y elimina ambas tareas, mata el watchdog, crea/limpia el flag de parada y borra la carpeta; con `-ClearAutoLogon` deshabilita el auto-logon. No desinstala TightVNC.
 
 ### Control remoto (`VncServerManager` + `VncRemoteControlService`)
 - **Detección**: busca `tvnserver.exe` en `Agent:Vnc:ExecutablePath`, `Agent:Vnc:InstallDir` (`%LOCALAPPDATA%\Pcp\vnc` por defecto), `Program Files[(x86)]\TightVNC` y, como último recurso, recursivamente en `InstallDir`. Solo se soporta **TightVNC en modo aplicación** (sin servicio).
@@ -268,6 +289,7 @@ Reglas del control remoto:
   cifrando la contraseña en claro (relleno a 8 con ceros); el cliente RFB usa como clave la
   contraseña con los bits invertidos.
 - **Túnel**: `ClientWebSocket` saliente a `ws(s)://{Agent:ServerUrl}/ws/vnc-agent/{sessionId}?secret=...`; abre `TcpClient` a `127.0.0.1:{puerto}` y bombea bytes en ambos sentidos (64 KB). El agente nunca escucha en la red.
+- **Kiosco**: al recibir `OpenVncTunnel` el agente llama a `IKioskWindowController.Suspend("vnc")` y en el `finally` del túnel lo reanuda (`Resume("vnc")`). Cubre cierre por orden del servidor, expiración, caída del socket y fallo al arrancar TightVNC. El vídeo puede seguir reproduciéndose minimizado.
 - **Cierre**: por `CloseVncTunnel`, por caída del WebSocket o al apagar el agente → mata `tvnserver`, restaura el registro y libera el puerto.
 
 ### Comandos soportados (`ProcessCommandAsync`)
@@ -277,6 +299,7 @@ Reglas del control remoto:
 | `pause` | Alterna play/pausa (`MediaPlayer.Pause()` si está reproduciendo, si no `Play()`). | Pausado/reanudado |
 | `stop` | `Stop()` y `CurrentMedia = "idle"`; emite thumbnail inmediata. | Detenido |
 | `volume` | Lee `volume`/`Volume` del JSON (case-insensitive vía TryGetProperty de ambas variantes) y aplica clamp 0–100. | Volumen ajustado |
+| `kiosk-pause` / `kiosk-resume` | Alias `pausekiosk`, `kiosk_pause`, `pause_kiosk` y `resumekiosk`, `kiosk_resume`, `resume_kiosk`. Suspende o reanuda el kiosco con el motivo `manual` (minimiza y quita `TopMost`). | Kiosco suspendido / reanudado |
 | `shutdown` / `restart` | **Simulados** por seguridad (no ejecutan nada). | "deshabilitado por seguridad" |
 | otro | `status = "error"` | Comando no soportado |
 
@@ -306,10 +329,21 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
 - El resultado del comando se envía al servidor después de programar el apagado/reinicio; el retardo da margen a que llegue. Requiere que el agente se ejecute en la sesión interactiva del usuario.
 
 ### Reproductor (`VlcPlayerManager`)
-- `Agent:DevMode` (bool): si es `true`, la ventana es normal, redimensionable, con bordes, `TopMost = false`, aparece en la barra de tareas y no oculta el cursor; si es `false` (kiosco), va maximizada, sin bordes, siempre al frente, sin cursor y con `Escape` para alternar pantalla completa.
-- Hilo STA dedicado que crea un `Form` WinForms; en modo kiosco: `FormBorderStyle.None`, maximizado, `TopMost`, sin cursor, fondo negro; `Escape` alterna maximizado/normal.
+- **Máquina de estados de la ventana** (siempre aplicada en el hilo STA con `BeginInvoke`):
+  - `Kiosk` (hay medio cargado): sin bordes, maximizada, `TopMost = true`, sin cursor.
+  - `Idle` (sin medio): sin bordes y maximizada según `Agent:Kiosk:IdleWindowState`, pero **nunca**
+    `TopMost`: la TV sigue mostrando el standby negro sin secuestrar el escritorio.
+  - `Suspended` (VNC activo u orden manual): normal/minimizada, con bordes, en la barra de tareas,
+    `TopMost = false` y cursor visible.
+- `IKioskWindowController` (`Suspend(reason)` / `Resume(reason)`) usa un `HashSet` de motivos
+  (`"vnc"`, `"manual"`): una orden manual y una sesión de control remoto no se reanudan entre sí.
+- `Agent:Kiosk:TopMostOnlyWhilePlaying` (bool, por defecto `true`) y `Agent:Kiosk:IdleWindowState`
+  (`Maximized` | `Normal` | `Minimized`, por defecto `Maximized`) controlan el comportamiento.
+- `Agent:DevMode` (bool): si es `true`, la ventana es normal, redimensionable, con bordes, `TopMost = false`, aparece en la barra de tareas y no oculta el cursor; si es `false` (kiosco), va maximizada, sin bordes, sin cursor y con `Escape` para alternar pantalla completa.
+- Hilo STA dedicado que crea un `Form` WinForms; en modo kiosco: `FormBorderStyle.None`, maximizado, `TopMost` solo con vídeo, sin cursor, fondo negro; `Escape` alterna maximizado/normal.
 - `Core.Initialize()` y `new LibVLC("--avcodec-hw=any", "--no-video-title-show", "--quiet")`; si falla, el agente sigue en **modo simulado** (sin video, heartbeat/thumbnails funcionan).
-- `Play`: acepta `http/https/rtsp` como URL; cualquier otra cosa se trata como ruta local (`Path.GetFullPath`); loop vía `:input-repeat=-1`.
+- `Play`: acepta `http/https/rtsp` como URL; cualquier otra cosa se trata como ruta local (`Path.GetFullPath`); loop vía `:input-repeat=-1`. Ya no hace `BringToFront` incondicional: si el kiosco está suspendido el vídeo sigue reproduciéndose minimizado y las miniaturas se capturan igual.
+- Eventos `Playing/Paused/Stopped/EndReached/EncounteredError` mantienen `HasMedia` sincronizado (fin de vídeo sin loop → `idle` y sin `TopMost`).
 - `Pause`: alterna; `Stop`: idle + stop; `SetVolume`: clamp 0–100.
 - `CaptureThumbnailBase64`: si hay video, `TakeSnapshot(0, temp.jpg, 320, 180)` y devuelve `data:image/jpeg;base64,...`; si no hay video o falla, genera un JPEG sintético 320×180 de standby (fondo degradado, "PCP KIOSK", "EN REPOSO" o "PAUSADO: archivo", ID + hora, punto verde).
 - Archivo temporal: `%TEMP%\pcp_snap_{guid}.jpg`, se borra tras leerlo.
@@ -331,7 +365,7 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
   - `Pausar` → `pause`; `Stop` → `stop`; "Aplicar volumen" → `{ volume }`.
   - Ruta por defecto en el input: `C:\videos\promo_verano.mp4`.
 - `Toast.tsx`: contenedor de alertas.
-- `FileExplorerModal.tsx`: modal del explorador remoto. Muestra unidades, breadcrumb, listado de carpetas/archivos, tamaño/fecha, subida múltiple a la carpeta actual, borrado con confirmación y botón "Reproducir" para videos (reutiliza el comando `play`). Se abre desde el botón "Archivos" de `ScreenCard` (solo si la pantalla está online).
+- `FileExplorerModal.tsx`: modal del explorador remoto. Muestra unidades, breadcrumb, listado de carpetas/archivos, tamaño/fecha, subida múltiple a la carpeta actual, borrado con confirmación y botón "Reproducir" para videos (reutiliza el comando `play`). Incluye **drag & drop** sobre el listado (rechaza carpetas y exige una carpeta abierta) y una barra de progreso real en dos fases: `Enviando al servidor` (XHR) y `Entregando al agente` (eventos SignalR), con velocidad, ETA y botón Cancelar. Se abre desde el botón "Archivos" de `ScreenCard` (solo si la pantalla está online).
 - `SystemActionsMenu.tsx`: menú "Sistema" de cada tarjeta con apagar PC, reiniciar, apagar monitor y bloquear sesión; confirmación para acciones destructivas.
 - `src/app/groups/page.tsx`: creación de grupos, selección de pantallas y listado.
 - `GroupCard.tsx`: edición de nombre/membresía, reproducción masiva con ruta/volumen, apagado y reinicio masivos.
@@ -351,6 +385,7 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
 - `fetchScreens()`: `GET /api/screens`, `cache: "no-store"`.
 - `sendScreenCommand(id, { type, payload })`: `POST /api/screens/{id}/command`; propaga `data.error` del servidor.
 - `fetchFiles(screenId, path?)`, `deleteFile(screenId, path)` y `uploadFile(screenId, directoryPath, file)`: consumen `/api/screens/{id}/files`.
+- `uploadFileWithProgress(screenId, directoryPath, file, { onBrowserProgress, signal })`: sube con `XMLHttpRequest` (progreso real navegador → servidor, cancelable con `AbortController`) y devuelve `{ clientRequestId, promise }`. El tramo servidor → agente se sigue con `subscribeUploadProgress(clientRequestId, cb)` (evento SignalR `FileUploadProgress`). `uploadFile` se mantiene como envoltorio sin progreso.
 - `startRemoteSession(screenId, viewOnly)` y `stopRemoteSession(screenId, sessionId?)`: consumen `/api/screens/{id}/remote/{start|stop}`.
 - `next.config.mjs` usa `output: "standalone"` y `npm start` respeta el `PORT` de la nube. `NEXT_PUBLIC_API_URL` es de build-time: si falta en producción, el panel cae a `http://localhost:5000` y registra un error en consola.
 
@@ -369,10 +404,10 @@ Espejo camelCase de los DTOs: `ScreenInfo` (incluye `remoteControlAvailable`), `
 4. **Reproducción**: un solo medio a la vez por pantalla; `stop` vuelve a `idle`; `pause` es *toggle* (no pausa idempotente).
 5. **Miniaturas**: el agente las produce cada 5 s (o inmediatamente tras play/stop); el servidor solo guarda **la última por pantalla en memoria** (no hay histórico ni persistencia). El panel las pinta en Base64.
 6. **Métricas**: CPU simulada, RAM aproximada del proceso, disco real. No usar estos valores para alertas de producción.
-7. **Seguridad**: HTTP sin autenticación; CORS limitado a `Cors:AllowedOrigins` (localhost automático solo en Development); `shutdown`/`restart` requieren `AllowSystemCommands`. Sigue siendo necesario HTTPS + login antes de exponer a Internet.
+7. **Seguridad**: HTTP sin autenticación; CORS limitado a `Cors:AllowedOrigins` (localhost automático solo en Development); `shutdown`/`restart` requieren `AllowSystemCommands`. Sigue siendo necesario HTTPS + login antes de exponer a Internet. El auto-logon opcional del instalador guarda la contraseña en texto claro en el registro: usar un usuario kiosco dedicado y sin privilegios de administrador.
 8. **Persistencia**: MySQL 8 con migraciones EF (`Database.Migrate()`); SQLite es solo fallback de desarrollo con `EnsureCreated()`. Thumbnails y mapeo de conexiones viven solo en memoria.
 9. **Sin tests automatizados** en la solución.
-10. **Archivos**: el explorador navega por las unidades fijas del agente con lista negra de rutas críticas; solo borra archivos, no carpetas; no sobrescribe archivos existentes; la subida va por chunks Base64 y se confirma en un archivo temporal movido al destino. "Reproducir" no descarga el archivo: envía `play` con la ruta local del agente.
+10. **Archivos**: el explorador navega por las unidades fijas del agente con lista negra de rutas críticas; solo borra archivos, no carpetas; no sobrescribe archivos existentes; la subida va por chunks Base64 y se confirma en un archivo temporal movido al destino. El panel muestra progreso real: XHR para el tramo navegador → servidor y `FileUploadProgress` (SignalR, identificado por `clientRequestId`) para el tramo servidor → agente. "Reproducir" no descarga el archivo: envía `play` con la ruta local del agente.
 11. **Transferencia de archivos**: el servidor actúa de puente; no almacena los archivos subidos. Si el agente se cae a mitad de una subida, el servidor cancela y el agente limpia el temporal al cancelar; si el proceso muere, puede quedar un `.pcp-upload-*.tmp`.
 12. **Grupos**: un grupo por pantalla; eliminar un grupo solo desasigna pantallas. Los comandos masivos omiten pantallas offline y devuelven el resumen de envíos.
 13. **Comandos de sistema**: `shutdown`, `restart`, `monitor-off` y `lock` son reales en el agente. Están protegidos por `Agent:AllowSystemCommands`, usan 5 s de retardo para apagar/reiniciar y el panel pide confirmación. Sin autenticación en la API, cualquier cliente de la red puede invocarlos: no exponer a Internet en esta fase.
@@ -410,7 +445,7 @@ powershell -ExecutionPolicy Bypass -File C:\Proyectos\Pcp\scripts\publish-agent.
 Claves de configuración relevantes:
 - `Pcp.Server/appsettings.json` → `Database:MySqlVersion`, `ConnectionStrings:DefaultConnection` (SQLite dev), `Files:MaxUploadMb`.
 - `Pcp.Server/appsettings.Production.json` → `Database:Provider=MySql`, `Cors:AllowedOrigins`. La cadena real **nunca** se versiona: usar `ConnectionStrings__MySql` o `DATABASE_URL`/`MYSQL_URL`/`MYSQL_ADDON_URI`, más `Cors__AllowedOrigins__0..N`, `PORT` y `Files__MaxUploadMb`.
-- `Pcp.Agent/appsettings.json` (opcional) → `Agent:ScreenId`, `Agent:Name`, `Agent:Token`, `Agent:ServerUrl`, `Agent:DevMode`, `Agent:AllowSystemCommands`, `Agent:SystemCommandDelaySeconds`, `Agent:FileRoots`, `Agent:ProtectedPaths`, `Agent:MaxUploadMb`, `Agent:Vnc:*`. Se puede omitir y usar `PCP_SERVER_URL`, `PCP_SCREEN_ID`, `PCP_SCREEN_NAME`, `PCP_TOKEN` o `PCP_Agent__*`.
+- `Pcp.Agent/appsettings.json` (opcional) → `Agent:ScreenId`, `Agent:Name`, `Agent:Token`, `Agent:ServerUrl`, `Agent:DevMode`, `Agent:AllowSystemCommands`, `Agent:SystemCommandDelaySeconds`, `Agent:FileRoots`, `Agent:ProtectedPaths`, `Agent:MaxUploadMb`, `Agent:LogPath`, `Agent:Kiosk:TopMostOnlyWhilePlaying`, `Agent:Kiosk:IdleWindowState`, `Agent:Vnc:*`. Se puede omitir y usar `PCP_SERVER_URL`, `PCP_SCREEN_ID`, `PCP_SCREEN_NAME`, `PCP_TOKEN` o `PCP_Agent__*`.
 - `Pcp.Web/.env.local` (dev) y `Pcp.Web/.env.production` (build) → `NEXT_PUBLIC_API_URL` (y `NEXT_PUBLIC_SERVER_URL`).
 - `.env.example` en la raíz documenta todas las variables de producción.
 
@@ -447,6 +482,8 @@ o con `Agent:ScreenId` (appsettings/CLI).
 - Solo se soporta TightVNC; UltraVNC/RealVNC se detectan como no disponibles hasta implementar su configuración.
 - El canal VNC no reenvía audio ni permite transferencia de archivos (a propósito); no hay métricas de latencia en el modal.
 - Si el agente corre como servicio (sesión 0) o queda un `tvnserver` huérfano, el control remoto falla con error explícito; no hay reintento automático de arranque del VNC.
+- El agente es `WinExe`: no hay consola y el diagnóstico exige leer `C:\ProgramData\PcpAgent\agent.log` (o `%LOCALAPPDATA%\Pcp\logs\agent.log` si no hay permisos).
+- El watchdog comprueba el proceso por nombre (`Pcp.Agent.exe`): asume una pantalla por stick. En desarrollo con varios agentes en el mismo equipo solo vigila que exista al menos uno.
 
 ---
 

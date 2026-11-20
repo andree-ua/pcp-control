@@ -3,7 +3,9 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import * as signalR from "@microsoft/signalr";
 import { CommandResultDto, ScreenInfo, ThumbnailDto, ToastMessage } from "@/types/screen";
+import { FileUploadProgress } from "@/types/files";
 import { fetchScreens, SERVER_URL } from "@/services/api";
+import { publishUploadProgress } from "@/services/uploadProgress";
 
 export function useScreensSignalR() {
   const [screens, setScreens] = useState<ScreenInfo[]>([]);
@@ -94,6 +96,11 @@ export function useScreensSignalR() {
           s.id === dto.screenId ? { ...s, thumbnailBase64: dto.thumbnailBase64 } : s
         )
       );
+    });
+
+    // Progreso real del tramo servidor -> agente durante una subida de archivos
+    connection.on("FileUploadProgress", (progress: FileUploadProgress) => {
+      publishUploadProgress(progress);
     });
 
     // Escuchar resultados de comandos

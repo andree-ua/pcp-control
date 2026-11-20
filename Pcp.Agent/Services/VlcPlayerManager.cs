@@ -5,16 +5,44 @@ using System.Windows.Forms;
 using LibVLCSharp.Shared;
 using LibVLCSharp.WinForms;
 using Microsoft.Extensions.Configuration;
+using Pcp.Agent.Logging;
 
 namespace Pcp.Agent.Services;
 
 /// <summary>
-/// Administrador del reproductor multimedia basado en LibVLCSharp para Windows.
-/// Gestiona una ventana de pantalla completa en modo kiosco (sin bordes, sin cursor)
-/// con aceleración por hardware y generación periódica de fotogramas (thumbnails).
+/// Control mínimo de la ventana del kiosco. Lo implementa <see cref="VlcPlayerManager"/>
+/// y lo consume el control remoto para liberar el escritorio mientras dura el VNC.
 /// </summary>
-public class VlcPlayerManager : IDisposable
+public interface IKioskWindowController
 {
+    /// <summary>Suspende el kiosco (minimiza la ventana, quita TopMost y libera el cursor).</summary>
+    void Suspend(string reason);
+
+    /// <summary>Reanuda el kiosco cuando ya no queda ningún motivo de suspensión.</summary>
+    void Resume(string reason);
+}
+
+/// <summary>
+/// Administrador del reproductor multimedia basado en LibVLCSharp para Windows.
+///
+/// Máquina de estados de la ventana (siempre aplicada en el hilo STA de la UI):
+///   - <c>Kiosk</c>: hay un medio cargado → maximizada, sin bordes, TopMost y cursor oculto.
+///   - <c>Idle</c>: sin medio → pantalla completa según <c>Agent:Kiosk:IdleWindowState</c>,
+///     pero NUNCA TopMost (no secuestra el escritorio).
+///   - <c>Suspended</c>: hay una sesión de VNC o una orden manual → normal/minimizada,
+///     en la barra de tareas, sin TopMost y con el cursor visible.
+///
+/// La suspensión usa un conjunto de motivos ("vnc", "manual") para que una orden del
+/// panel y una sesión de control remoto no se reanuden entre sí por error.
+/// </summary>
+public class VlcPlayerManager : IKioskWindowController, IDisposable
+{
+    /// <summary>Motivo de suspensión usado por el túnel de escritorio remoto.</summary>
+    public const string VncSuspendReason = "vnc";
+
+    /// <summary>Motivo de suspensión usado por las órdenes manuales del panel.</summary>
+    public const string ManualSuspendReason = "manual";
+
     private LibVLC? _libVLC;
     private MediaPlayer? _mediaPlayer;
     private VideoView? _videoView;
@@ -26,15 +54,42 @@ public class VlcPlayerManager : IDisposable
     private int _volume = 80;
     private readonly string _tempSnapshotPath;
     private readonly bool _devMode;
+    private readonly bool _topMostWhilePlaying;
+    private readonly string _idleWindowState;
     private bool _isDisposed;
+
+    private readonly HashSet<string> _suspendReasons = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _stateLock = new();
+    private volatile bool _hasMedia;
+    private bool _cursorHidden;
+    private bool _suspendedLogged;
 
     public string CurrentMedia => _currentMedia;
     public int Volume => _volume;
     public bool IsPlaying => _mediaPlayer?.IsPlaying ?? false;
 
+    /// <summary>Indica si hay un medio cargado (reproduciendo o en pausa).</summary>
+    public bool HasMedia => _hasMedia;
+
+    /// <summary>Indica si el kiosco está suspendido por VNC o por una orden manual.</summary>
+    public bool IsKioskSuspended
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _suspendReasons.Count > 0;
+            }
+        }
+    }
+
     public VlcPlayerManager(IConfiguration configuration)
     {
         _devMode = configuration.GetValue<bool>("Agent:DevMode");
+        _topMostWhilePlaying = configuration.GetValue("Agent:Kiosk:TopMostOnlyWhilePlaying", true);
+        _idleWindowState = (configuration["Agent:Kiosk:IdleWindowState"] ?? "Maximized")
+            .Trim()
+            .ToLowerInvariant();
         _tempSnapshotPath = Path.Combine(Path.GetTempPath(), $"pcp_snap_{Guid.NewGuid():N}.jpg");
 
         // Hilo STA dedicado a la ventana de reproducción WinForms
@@ -58,9 +113,7 @@ public class VlcPlayerManager : IDisposable
             }
             catch (Exception coreEx)
             {
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"[AVISO VLC] Core.Initialize advirtió: {coreEx.Message}. Continuando...");
-                Console.ResetColor();
+                AgentLog.Warn($"[AVISO VLC] Core.Initialize advirtió: {coreEx.Message}. Continuando...");
             }
 
             // Parámetros de aceleración por hardware limpios y compatibles con LibVLC en Windows
@@ -71,22 +124,21 @@ public class VlcPlayerManager : IDisposable
             }
             catch (Exception vlcEx)
             {
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"[AVISO VLC] No se pudo instanciar LibVLC nativo ({vlcEx.Message}). El agente continuará en modo simulado.");
-                Console.ResetColor();
+                AgentLog.Warn($"[AVISO VLC] No se pudo instanciar LibVLC nativo ({vlcEx.Message}). El agente continuará en modo simulado.");
                 _libVLC = null;
                 _mediaPlayer = null;
             }
 
             // Crear ventana de reproducción:
-            // - Producción: kiosco a pantalla completa, sin bordes, siempre al frente.
+            // - Producción: kiosco sin bordes. Arranca maximizada pero SIN TopMost:
+            //   el modo "siempre al frente" solo se aplica cuando hay vídeo (ApplyWindowMode).
             // - Desarrollo: ventana normal redimensionable y movable, sin TopMost.
             _kioskForm = new Form
             {
                 Text = _devMode ? "PCP Kiosk Player (DEV)" : "PCP Kiosk Player",
                 FormBorderStyle = _devMode ? FormBorderStyle.Sizable : FormBorderStyle.None,
                 WindowState = _devMode ? FormWindowState.Normal : FormWindowState.Maximized,
-                TopMost = !_devMode,
+                TopMost = false,
                 BackColor = Color.Black,
                 ShowInTaskbar = _devMode,
                 StartPosition = FormStartPosition.CenterScreen
@@ -107,15 +159,14 @@ public class VlcPlayerManager : IDisposable
                     MediaPlayer = _mediaPlayer
                 };
                 _kioskForm.Controls.Add(_videoView);
+                SubscribePlayerEvents(_mediaPlayer);
             }
 
             _kioskForm.Load += (s, e) =>
             {
-                if (!_devMode)
-                {
-                    try { Cursor.Hide(); } catch { }
-                }
-
+                // Aplica el modo efectivo: idle (sin TopMost) o suspendido si el VNC llegó antes.
+                ApplyWindowModeCore();
+                WriteKioskLog($"Ventana lista en modo {DescribeMode()}.");
                 _readyEvent.Set();
             };
 
@@ -134,14 +185,57 @@ public class VlcPlayerManager : IDisposable
         }
         catch (Exception ex)
         {
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine($"[AVISO KIOSK UI] Ventana de reproducción no disponible ({ex.Message}). Agente operativo en modo fondo.");
-            Console.ResetColor();
+            AgentLog.Warn($"[AVISO KIOSK UI] Ventana de reproducción no disponible ({ex.Message}). Agente operativo en modo fondo.");
         }
         finally
         {
             _readyEvent.Set();
         }
+    }
+
+    /// <summary>
+    /// Mantiene sincronizado el estado "hay medio" aunque el vídeo falle o termine sin loop.
+    /// Los eventos llegan desde hilos de LibVLC: el cambio de ventana se marshalea a la UI.
+    /// </summary>
+    private void SubscribePlayerEvents(MediaPlayer player)
+    {
+        player.Playing += (s, e) =>
+        {
+            _hasMedia = true;
+            ApplyWindowMode();
+        };
+
+        player.Paused += (s, e) =>
+        {
+            // Una pausa sigue mostrando el medio en pantalla: el kiosco se mantiene.
+            _hasMedia = true;
+            ApplyWindowMode();
+        };
+
+        player.Stopped += (s, e) =>
+        {
+            // "Stopped" también se dispara al cambiar de medio: solo se degrada a idle
+            // cuando el comando stop ya marcó el estado como tal.
+            if (string.Equals(_currentMedia, "idle", StringComparison.Ordinal))
+            {
+                _hasMedia = false;
+                ApplyWindowMode();
+            }
+        };
+
+        player.EndReached += (s, e) =>
+        {
+            // Sin loop el medio termina: vuelve a reposo y el kiosco deja de ser TopMost.
+            _currentMedia = "idle";
+            _hasMedia = false;
+            ApplyWindowMode();
+        };
+
+        player.EncounteredError += (s, e) =>
+        {
+            _hasMedia = false;
+            ApplyWindowMode();
+        };
     }
 
     /// <summary>
@@ -152,7 +246,13 @@ public class VlcPlayerManager : IDisposable
         _volume = Math.Clamp(volume, 0, 100);
         _currentMedia = mediaPath;
 
-        if (_libVLC == null || _mediaPlayer == null) return;
+        if (_libVLC == null || _mediaPlayer == null)
+        {
+            // Modo degradado: no hay vídeo real, la ventana permanece en reposo.
+            _hasMedia = false;
+            ApplyWindowMode();
+            return;
+        }
 
         try
         {
@@ -179,22 +279,17 @@ public class VlcPlayerManager : IDisposable
             _mediaPlayer.Volume = _volume;
             _mediaPlayer.Play();
 
-            // Asegurar que la ventana esté visible al reproducir
-            if (_kioskForm != null && _kioskForm.IsHandleCreated)
-            {
-                _kioskForm.Invoke(() =>
-                {
-                    _kioskForm.Visible = true;
-                    _kioskForm.BringToFront();
-                });
-            }
+            _hasMedia = true;
         }
         catch (Exception ex)
         {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"[VLC PLAY ERROR] {ex.Message}");
-            Console.ResetColor();
+            _hasMedia = false;
+            AgentLog.Error($"[VLC PLAY ERROR] {ex.Message}");
         }
+
+        // No se fuerza BringToFront aquí: si el kiosco está suspendido (VNC activo),
+        // el vídeo sigue reproduciéndose minimizado para no tapar el escritorio.
+        ApplyWindowMode();
     }
 
     /// <summary>
@@ -216,15 +311,18 @@ public class VlcPlayerManager : IDisposable
     }
 
     /// <summary>
-    /// Detiene la reproducción y regresa a reposo.
+    /// Detiene la reproducción y regresa a reposo (la ventana deja de ser TopMost).
     /// </summary>
     public void Stop()
     {
         _currentMedia = "idle";
+        _hasMedia = false;
         if (_mediaPlayer != null)
         {
             _mediaPlayer.Stop();
         }
+
+        ApplyWindowMode();
     }
 
     /// <summary>
@@ -237,6 +335,242 @@ public class VlcPlayerManager : IDisposable
         {
             _mediaPlayer.Volume = _volume;
         }
+    }
+
+    /// <summary>
+    /// Suspende el kiosco: minimiza la ventana, quita TopMost, la muestra en la barra de
+    /// tareas y devuelve el cursor. Idempotente por motivo.
+    /// </summary>
+    public void Suspend(string reason)
+    {
+        var key = NormalizeReason(reason);
+
+        bool changed;
+        lock (_stateLock)
+        {
+            changed = _suspendReasons.Add(key);
+        }
+
+        if (!changed)
+        {
+            return;
+        }
+
+        WriteKioskLog($"Suspensión solicitada ({key}). Motivos activos: {DescribeReasons()}.");
+        ApplyWindowMode();
+    }
+
+    /// <summary>
+    /// Reanuda el kiosco solo cuando no queda ningún motivo de suspensión activo.
+    /// </summary>
+    public void Resume(string reason)
+    {
+        var key = NormalizeReason(reason);
+
+        bool changed;
+        lock (_stateLock)
+        {
+            changed = _suspendReasons.Remove(key);
+        }
+
+        if (!changed)
+        {
+            return;
+        }
+
+        WriteKioskLog($"Suspensión liberada ({key}). Motivos activos: {DescribeReasons()}.");
+        ApplyWindowMode();
+    }
+
+    private static string NormalizeReason(string? reason)
+        => string.IsNullOrWhiteSpace(reason) ? ManualSuspendReason : reason.Trim();
+
+    private string DescribeReasons()
+    {
+        lock (_stateLock)
+        {
+            return _suspendReasons.Count == 0 ? "ninguno" : string.Join(", ", _suspendReasons);
+        }
+    }
+
+    private string DescribeMode()
+    {
+        if (IsKioskSuspended) return "suspendido";
+        return _hasMedia ? "kiosco" : "reposo";
+    }
+
+    /// <summary>
+    /// Aplica el modo de ventana efectivo. Se puede llamar desde cualquier hilo:
+    /// el cambio real se ejecuta en el hilo STA mediante BeginInvoke.
+    /// </summary>
+    private void ApplyWindowMode()
+    {
+        RunOnUi(ApplyWindowModeCore);
+    }
+
+    /// <summary>
+    /// Debe ejecutarse siempre en el hilo de la UI.
+    /// </summary>
+    private void ApplyWindowModeCore()
+    {
+        var form = _kioskForm;
+        if (form == null || form.IsDisposed || !form.IsHandleCreated)
+        {
+            return;
+        }
+
+        var suspended = IsKioskSuspended;
+
+        try
+        {
+            if (_devMode)
+            {
+                // En desarrollo nunca se secuestra el escritorio: ventana normal y sin TopMost.
+                form.TopMost = false;
+                SetCursorHidden(false);
+                if (form.WindowState == FormWindowState.Minimized)
+                {
+                    form.WindowState = FormWindowState.Normal;
+                }
+                return;
+            }
+
+            if (suspended)
+            {
+                // 1) Devolver el escritorio al operador VNC.
+                form.TopMost = false;
+                form.ShowInTaskbar = true;
+
+                // Solo se normaliza cuando de verdad hay que cambiar el marco; si ya está
+                // minimizada no se toca (evita parpadeos con cada evento del reproductor).
+                if (form.WindowState != FormWindowState.Minimized)
+                {
+                    if (form.WindowState != FormWindowState.Normal)
+                    {
+                        form.WindowState = FormWindowState.Normal;
+                    }
+
+                    // Con borde mientras está suspendida: permite Alt+Tab y restaurarla.
+                    form.FormBorderStyle = FormBorderStyle.Sizable;
+                    form.WindowState = FormWindowState.Minimized;
+                }
+                else
+                {
+                    // El estilo se aplica al restaurar la ventana, sin mostrarla ahora.
+                    form.FormBorderStyle = FormBorderStyle.Sizable;
+                }
+
+                SetCursorHidden(false);
+
+                if (!_suspendedLogged)
+                {
+                    _suspendedLogged = true;
+                    WriteKioskLog("Kiosco minimizado: el escritorio queda libre para el control remoto.");
+                }
+
+                return;
+            }
+
+            // 2) Restaurar la ventana del kiosco.
+            if (form.WindowState == FormWindowState.Minimized)
+            {
+                form.WindowState = FormWindowState.Normal;
+            }
+
+            form.FormBorderStyle = FormBorderStyle.None;
+            form.ShowInTaskbar = false;
+            form.Visible = true;
+
+            var targetState = _hasMedia ? FormWindowState.Maximized : IdleFormState();
+            form.WindowState = targetState;
+
+            // Requisito clave: TopMost SOLO con un medio cargado.
+            form.TopMost = _hasMedia && _topMostWhilePlaying;
+
+            SetCursorHidden(targetState != FormWindowState.Minimized);
+
+            if (_hasMedia)
+            {
+                form.BringToFront();
+            }
+
+            if (_suspendedLogged)
+            {
+                _suspendedLogged = false;
+                WriteKioskLog($"Kiosco restaurado en modo {(_hasMedia ? "kiosco" : "reposo")}.");
+            }
+        }
+        catch (Exception ex)
+        {
+            AgentLog.Warn($"[KIOSK AVISO] No se pudo aplicar el modo de ventana: {ex.Message}");
+        }
+    }
+
+    private FormWindowState IdleFormState()
+        => _idleWindowState switch
+        {
+            "normal" => FormWindowState.Normal,
+            "minimized" => FormWindowState.Minimized,
+            _ => FormWindowState.Maximized
+        };
+
+    /// <summary>
+    /// Oculta o muestra el cursor del kiosco sin desbalancear el contador de ShowCursor.
+    /// Solo se llama desde el hilo de la UI.
+    /// </summary>
+    private void SetCursorHidden(bool hidden)
+    {
+        if (_cursorHidden == hidden)
+        {
+            return;
+        }
+
+        try
+        {
+            if (hidden)
+            {
+                Cursor.Hide();
+            }
+            else
+            {
+                Cursor.Show();
+            }
+
+            _cursorHidden = hidden;
+        }
+        catch
+        {
+            // El cursor del sistema no es crítico.
+        }
+    }
+
+    private static void WriteKioskLog(string message)
+    {
+        AgentLog.Info($"[KIOSK] {message}");
+    }
+
+    /// <summary>Ejecuta una acción en el hilo STA de la ventana, sin bloquear al llamador.</summary>
+    private void RunOnUi(Action action)
+    {
+        var form = _kioskForm;
+        if (form == null || form.IsDisposed || !form.IsHandleCreated)
+        {
+            return;
+        }
+
+        try
+        {
+            if (form.InvokeRequired)
+            {
+                form.BeginInvoke(action);
+            }
+            else
+            {
+                action();
+            }
+        }
+        catch (ObjectDisposedException) { }
+        catch (InvalidOperationException) { }
     }
 
     /// <summary>
@@ -275,7 +609,7 @@ public class VlcPlayerManager : IDisposable
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[SNAPSHOT ERROR] {ex.Message}");
+                AgentLog.Error($"[SNAPSHOT ERROR] {ex.Message}");
             }
         }
 

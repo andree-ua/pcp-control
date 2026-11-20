@@ -98,30 +98,115 @@ export async function deleteFile(screenId: string, path: string): Promise<void> 
   }
 }
 
+export interface UploadHandle {
+  /** Identificador con el que el servidor etiqueta los eventos de progreso. */
+  clientRequestId: string;
+  promise: Promise<FileOperationResponse>;
+}
+
+export interface UploadOptions {
+  /** Progreso real del navegador → servidor (bytes enviados por el navegador). */
+  onBrowserProgress?: (loaded: number, total: number) => void;
+  signal?: AbortSignal;
+}
+
+function createUploadRequestId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * Sube un archivo mostrando el progreso real del tramo navegador → servidor.
+ *
+ * `fetch` no expone el progreso de subida, por eso se usa XMLHttpRequest. El tramo
+ * servidor → agente se sigue con el evento SignalR `FileUploadProgress`, que el
+ * servidor etiqueta con `clientRequestId`.
+ */
+export function uploadFileWithProgress(
+  screenId: string,
+  directoryPath: string,
+  file: File,
+  options: UploadOptions = {}
+): UploadHandle {
+  const clientRequestId = createUploadRequestId();
+  const query = new URLSearchParams({ path: directoryPath, clientRequestId });
+  const url =
+    `${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/files/upload?` + query.toString();
+
+  const promise = new Promise<FileOperationResponse>((resolve, reject) => {
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const xhr = new XMLHttpRequest();
+    const handleAbort = () => xhr.abort();
+    const cleanup = () => options.signal?.removeEventListener("abort", handleAbort);
+
+    xhr.open("POST", url, true);
+    xhr.withCredentials = true;
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        options.onBrowserProgress?.(event.loaded, event.total);
+      }
+    };
+
+    xhr.onload = () => {
+      cleanup();
+
+      let data: { error?: string; success?: boolean; savedPath?: string } | null = null;
+      try {
+        data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        data = null;
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(data as FileOperationResponse);
+        return;
+      }
+
+      reject(new Error(data?.error || `No se pudo subir el archivo (HTTP ${xhr.status})`));
+    };
+
+    xhr.onerror = () => {
+      cleanup();
+      reject(new Error("Error de red al subir el archivo."));
+    };
+
+    xhr.ontimeout = () => {
+      cleanup();
+      reject(new Error("La subida agotó el tiempo de espera."));
+    };
+
+    xhr.onabort = () => {
+      cleanup();
+      reject(new DOMException("Subida cancelada por el operador.", "AbortError"));
+    };
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        reject(new DOMException("Subida cancelada por el operador.", "AbortError"));
+        return;
+      }
+
+      options.signal.addEventListener("abort", handleAbort, { once: true });
+    }
+
+    xhr.send(formData);
+  });
+
+  return { clientRequestId, promise };
+}
+
 export async function uploadFile(
   screenId: string,
   directoryPath: string,
   file: File
 ): Promise<FileOperationResponse> {
-  const formData = new FormData();
-  formData.append("file", file);
-
-  const response = await fetch(
-    `${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/files/upload?path=${encodeURIComponent(directoryPath)}`,
-    {
-      method: "POST",
-      credentials: "include",
-      body: formData,
-    }
-  );
-
-  const data = await response.json().catch(() => null);
-
-  if (!response.ok) {
-    throw new Error(data?.error || `No se pudo subir el archivo (HTTP ${response.status})`);
-  }
-
-  return data as FileOperationResponse;
+  return uploadFileWithProgress(screenId, directoryPath, file).promise;
 }
 
 export async function fetchGroups(): Promise<GroupInfo[]> {
