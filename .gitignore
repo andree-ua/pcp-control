@@ -17,6 +17,8 @@ Pcp.Web/out/
 
 # Base de datos local
 *.db
+*.db-shm
+*.db-wal
 pcp.db
 
 # Archivos de entorno (Secretos)

@@ -355,3 +355,36 @@ masivas. Para reconfigurar por RMM sin tocar archivos, ejecutar `install.ps1 ...
 Desinstalación: `powershell -ExecutionPolicy Bypass -File uninstall.ps1` (detiene y elimina ambas
 tareas, mata el watchdog y borra la carpeta; no desinstala TightVNC). Añade `-ClearAutoLogon` si el
 instalador había habilitado el auto-logon.
+
+### 5. Proyector en la nube (Oracle Cloud Free Tier, 0 €)
+
+El proyector (Bloque 5) ya no necesita una PC local: MediaMTX se despliega en
+una instancia **Always Free** de Oracle Cloud y el panel publica por WHIP.
+
+Guía completa, puertos y diagnóstico: **[`deploy/mediamtx/README.md`](deploy/mediamtx/README.md)**.
+
+```bash
+# En la instancia Ubuntu recién creada (SSH):
+scp -i clave.pem deploy/mediamtx/setup-oracle-cloud.sh ubuntu@IP:/tmp/
+sudo bash /tmp/setup-oracle-cloud.sh \
+  --server-url https://TU-SERVICIO.onrender.com \
+  --domain pcp-media.duckdns.org      # DuckDNS gratis + Caddy/HTTPS
+```
+
+El script instala Docker, construye la imagen, abre `8889/tcp`, `8189/udp`,
+`8554/tcp` y `8888/tcp` en iptables (además de la Security List de OCI) y deja
+el contenedor con `restart: unless-stopped`. Al terminar imprime las variables
+que debes pegar en **Render → Environment**:
+
+```bash
+Projector__PublicWhipBaseUrl=https://pcp-media.duckdns.org
+Projector__PublicHlsBaseUrl=http://IP_PUBLICA:8888
+Projector__PublicRtspUrl=rtsp://IP_PUBLICA:8554
+Projector__HealthCheckEnabled=true
+```
+
+**Fail-safe:** el servidor sondea MediaMTX antes de abrir/confirmar la emisión y
+cada 20 s mientras está en directo. Si no responde, devuelve
+`"Servidor de Streaming no disponible"` al panel, el agente vuelve a `idle` y el
+panel muestra el error. Se puede desactivar con
+`Projector__HealthCheckEnabled=false` en desarrollo.

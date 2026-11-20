@@ -201,6 +201,22 @@ public class AgentService : BackgroundService
             _remoteControl.Stop(sessionId);
         });
 
+        // 4d. Proyector (Bloque 5): el panel publica por WHIP a MediaMTX y el
+        // agente reproduce el stream con caché baja. El estado vuelve al servidor
+        // para que el operador confirme que la TV está viendo la emisión.
+        _hubConnection.On<ProjectorCommandPayload>(ProjectorEvents.Open, async payload =>
+        {
+            await HandleProjectorOpenAsync(payload, screenId);
+        });
+
+        _hubConnection.On<string>(ProjectorEvents.Close, async sessionId =>
+        {
+            AgentLog.Info($"[PROJECTOR] Cierre de emisión recibido (sesión {sessionId}).");
+            _playerManager.StopStream(sessionId);
+            await ReportProjectorStatusAsync(
+                screenId, sessionId ?? string.Empty, true, "Emisión detenida por el servidor.", null);
+        });
+
         // 5. Iniciar conexión al Hub con reintentos hasta que el servidor esté disponible
         await ConnectWithRetryAsync(stoppingToken);
 
@@ -502,6 +518,82 @@ public class AgentService : BackgroundService
         }
 
         return (cpu, ram, freeDiskMb);
+    }
+
+    /// <summary>
+    /// Atiende la orden de proyección (Bloque 5): arranca el stream de MediaMTX con
+    /// caché baja y reporta el resultado. Si la publicación aún no está lista, el
+    /// reproductor sigue reintentando en segundo plano.
+    /// </summary>
+    private async Task HandleProjectorOpenAsync(ProjectorCommandPayload payload, string screenId)
+    {
+        AgentLog.Info(
+            $"[PROJECTOR] Emisión solicitada: sesión {payload.SessionId}, protocolo {payload.Protocol}, " +
+            $"caché {payload.BufferMs} ms, volumen {payload.Volume}%.");
+
+        ProjectorStreamResult result;
+        try
+        {
+            result = _playerManager.PlayStream(
+                payload.StreamUrl,
+                payload.FallbackUrl,
+                payload.Volume,
+                payload.BufferMs,
+                payload.Title,
+                payload.SessionId);
+        }
+        catch (Exception ex)
+        {
+            result = new ProjectorStreamResult
+            {
+                Started = false,
+                Protocol = payload.Protocol,
+                Detail = $"Error al iniciar la emisión: {ex.Message}"
+            };
+        }
+
+        await ReportProjectorStatusAsync(
+            screenId, payload.SessionId, result.Started, result.Detail, result.Protocol);
+
+        if (result.Started)
+        {
+            // La primera miniatura del stream tarda en tener fotograma real.
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(2500);
+                await EmitThumbnailAsync(screenId);
+            });
+        }
+    }
+
+    /// <summary>Informa al servidor del estado de la emisión del proyector.</summary>
+    private async Task ReportProjectorStatusAsync(
+        string screenId,
+        string sessionId,
+        bool success,
+        string? detail,
+        string? protocol)
+    {
+        if (_hubConnection?.State != HubConnectionState.Connected)
+        {
+            return;
+        }
+
+        try
+        {
+            await _hubConnection.InvokeAsync(ProjectorEvents.Status, new ProjectorStatusDto
+            {
+                SessionId = sessionId,
+                ScreenId = screenId,
+                Success = success,
+                Detail = detail,
+                Protocol = protocol
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("No se pudo enviar el estado del proyector: {Message}", ex.Message);
+        }
     }
 
     /// <summary>

@@ -8,6 +8,10 @@ import {
   PlaylistUpsert,
 } from "@/types/playlist";
 import { Schedule, ScheduleUpsert } from "@/types/schedule";
+import {
+  ProjectorActionResponse,
+  ProjectorSession,
+} from "@/types/projector";
 
 // NEXT_PUBLIC_* se inyecta en tiempo de build (Next.js la incrusta en el bundle).
 // En producción se define en Pcp.Web/.env.production o en el panel de la nube.
@@ -638,5 +642,94 @@ export async function stopRemoteSession(screenId: string, sessionId?: string): P
     });
   } catch {
     // El cierre es best-effort: el servidor cierra la sesión al caer el WebSocket.
+  }
+}
+
+// ── Proyector / streaming (Bloque 5) ───────────────────────────────────────
+
+/**
+ * Prepara una sesión de proyección: el servidor crea los tokens y devuelve la
+ * URL WHIP a la que el navegador publicará el MediaStream.
+ */
+export async function startProjectorSession(
+  screenId: string,
+  options: { volume?: number; bufferMs?: number; title?: string } = {}
+): Promise<ProjectorSession> {
+  const response = await apiFetch(
+    `${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/projector/start`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        volume: options.volume ?? null,
+        bufferMs: options.bufferMs ?? null,
+        title: options.title ?? null,
+      }),
+    }
+  );
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(data?.error || `No se pudo preparar el proyector (HTTP ${response.status})`);
+  }
+
+  return data as ProjectorSession;
+}
+
+/**
+ * Confirma que el WHIP ya está publicando y ordena al agente reproducir el stream.
+ * El servidor espera la confirmación del agente antes de responder.
+ */
+export async function notifyProjectorLive(
+  screenId: string,
+  sessionId: string
+): Promise<ProjectorActionResponse> {
+  const response = await apiFetch(
+    `${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/projector/live`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId }),
+    }
+  );
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(
+      data?.error || `La pantalla no pudo abrir la emisión (HTTP ${response.status})`
+    );
+  }
+
+  return data as ProjectorActionResponse;
+}
+
+/**
+ * Cierra la emisión y libera la sesión del proyector. Es best-effort: el cierre
+ * del modal y la caducidad de la sesión también la terminan.
+ */
+export async function stopProjectorSession(screenId: string, sessionId?: string): Promise<void> {
+  try {
+    await apiFetch(
+      `${SERVER_URL}/api/screens/${encodeURIComponent(screenId)}/projector/stop`,
+      {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ sessionId: sessionId ?? null }),
+        keepalive: true,
+      }
+    );
+  } catch {
+    // Cierre best-effort: el servidor limpia la sesión al caducar.
   }
 }

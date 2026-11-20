@@ -20,6 +20,7 @@ public class ScreenHub : Hub
     private readonly IScreenConnectionManager _connectionManager;
     private readonly IFileRequestManager _fileRequests;
     private readonly IVncSessionManager _vncSessions;
+    private readonly IProjectorSessionManager _projectorSessions;
     private readonly ILogger<ScreenHub> _logger;
 
     // Almacén en memoria de las últimas miniaturas capturadas por pantalla
@@ -45,12 +46,14 @@ public class ScreenHub : Hub
         IScreenConnectionManager connectionManager,
         IFileRequestManager fileRequests,
         IVncSessionManager vncSessions,
+        IProjectorSessionManager projectorSessions,
         ILogger<ScreenHub> logger)
     {
         _db = db;
         _connectionManager = connectionManager;
         _fileRequests = fileRequests;
         _vncSessions = vncSessions;
+        _projectorSessions = projectorSessions;
         _logger = logger;
     }
 
@@ -122,8 +125,9 @@ public class ScreenHub : Hub
             _connectionManager.RemoveConnection(Context.ConnectionId);
             _fileRequests.CancelPending(screenId, "El agente se desconectó durante la operación.");
 
-            // Cerrar cualquier sesión de escritorio remoto activa de esa pantalla
+            // Cerrar cualquier sesión de escritorio remoto o proyección activa de esa pantalla
             _vncSessions.CloseByScreen(screenId, "El agente se desconectó.");
+            _projectorSessions.CloseByScreen(screenId, "El agente se desconectó.");
             _remoteControlAvailable[screenId] = false;
 
             var screen = await _db.Screens.FindAsync(screenId);
@@ -314,6 +318,24 @@ public class ScreenHub : Hub
 
         _vncSessions.ReportStatus(dto);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Recibe el estado de la emisión del proyector reportado por el agente y lo
+    /// retransmite al panel (Bloque 5).
+    /// </summary>
+    [Authorize(Roles = TokenService.AgentRole)]
+    public async Task ProjectorStatus(ProjectorStatusDto dto)
+    {
+        if (!IsOwnScreen(dto.ScreenId))
+        {
+            _logger.LogWarning("ProjectorStatus rechazado: el agente de '{Claim}' intentó reportar '{ScreenId}'.",
+                CurrentAgentScreenId, dto.ScreenId);
+            return;
+        }
+
+        _projectorSessions.ReportStatus(dto);
+        await Clients.Group("panel").SendAsync(ProjectorEvents.StatusReceived, dto);
     }
 
     /// <summary>

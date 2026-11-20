@@ -1,0 +1,70 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# MediaMTX para el proyector de PCP (Bloque 5)
+#
+# Flujo:  Panel (navegador) --WHIP--> MediaMTX --RTSP--> Agente (LibVLC)
+#                                      \--HLS---> respaldo / diagnóstico
+#
+# La autorización se delega al Pcp.Server: MediaMTX pregunta por cada
+# publicación (publish) y cada lectura (read) antes de aceptarla.
+#
+# En la nube, docker-compose.yml / setup-oracle-cloud.sh sobreescriben:
+#   MTX_AUTHHTTPADDRESS          (URL del Pcp.Server en Render)
+#   MTX_WEBRTCADDITIONALHOSTS    (IP pública de la instancia)
+#   MTX_WEBRTCIPSFROMINTERFACES  (false: no anunciar la IP privada 10.x)
+# ═══════════════════════════════════════════════════════════════════════════
+
+logLevel: info
+logDestinations: [stdout]
+logStructured: false
+
+# API HTTP interna (diagnóstico). En docker-compose se publica solo en
+# 127.0.0.1:9997; no la expongas a Internet: no tiene autenticación propia.
+api: true
+apiAddress: :9997
+
+# ── Autenticación delegada al servidor PCP ─────────────────────────────────
+authMethod: http
+authHTTPAddress: http://host.docker.internal:5000/api/projector/auth
+authHTTPExclude:
+  - action: api
+  - action: metrics
+  - action: pprof
+
+# ── RTSP: lo usa el agente ─────────────────────────────────────────────────
+# El agente fuerza RTSP sobre TCP (:rtsp-tcp), así que no hacen falta los
+# puertos UDP de RTP/RTCP ni el rango multicast.
+rtsp: true
+rtspAddress: :8554
+rtspTransports: [tcp]
+rtspEncryption: "no"
+
+# ── HLS de baja latencia: respaldo del agente ──────────────────────────────
+hls: true
+hlsAddress: :8888
+hlsVariant: lowLatency
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsSegmentCount: 7
+
+# ── WebRTC / WHIP: publica el panel ────────────────────────────────────────
+webrtc: true
+webrtcAddress: :8889
+webrtcLocalUDPAddress: :8189
+webrtcIPsFromInterfaces: true
+webrtcAdditionalHosts: []
+# El panel vive en otro dominio (Vercel/Render): se permite el origen cruzado.
+webrtcAllowOrigins: ["*"]
+
+# En cloud hay que anunciar la IP pública. La forma recomendada es por entorno:
+#   PUBLIC_HOST=203.0.113.10
+#   MTX_WEBRTCADDITIONALHOSTS=$PUBLIC_HOST
+#   MTX_WEBRTCIPSFROMINTERFACES=false
+# y abrir 8189/udp en el firewall. Si se usa un dominio HTTPS delante (Caddy),
+# ese dominio solo cubre el handshake WHIP; los candidatos ICE deben ser la IP.
+
+# ── Paths ──────────────────────────────────────────────────────────────────
+# El servidor crea rutas "pcp/<screenId>" y las reserva a un único publicador.
+# El sufijo /whip es el endpoint WHIP que usa el panel.
+paths:
+  all_others:
+    source: publisher

@@ -1,0 +1,38 @@
+# Overlay opcional: HTTPS para el WHIP con Caddy y Let's Encrypt.
+#
+# Uso (requiere un dominio con DNS A apuntando a la IP pública y los puertos
+# 80/443 abiertos en el firewall de Oracle):
+#
+#   PCP_DOMAIN=pcp-media.duckdns.org docker compose \
+#     -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+#
+# Caddy solo hace de proxy del handshake WHIP (TCP 8889). El vídeo viaja por
+# UDP 8189 directamente entre el navegador y MediaMTX.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: pcp-caddy
+    restart: unless-stopped
+    network_mode: host
+
+    environment:
+      PCP_DOMAIN: ${PCP_DOMAIN:?Define PCP_DOMAIN con el dominio HTTPS}
+
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+    depends_on:
+      - mediamtx
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy_data:
+  caddy_config:

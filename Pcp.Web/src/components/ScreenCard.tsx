@@ -6,6 +6,7 @@ import { sendScreenCommand, syncPlay, wakeScreen } from "@/services/api";
 import { useAuth } from "@/context/AuthContext";
 import { FileExplorerModal } from "@/components/FileExplorerModal";
 import { RemoteDesktopModal } from "@/components/RemoteDesktopModal";
+import { ProjectorModal } from "@/components/ProjectorModal";
 import { SystemActionsMenu } from "@/components/SystemActionsMenu";
 import {
   Play,
@@ -26,6 +27,7 @@ import {
   Power,
   AlarmClock,
   Loader2,
+  Cast,
 } from "lucide-react";
 
 interface ScreenCardProps {
@@ -40,6 +42,7 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
   const [showOptions, setShowOptions] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
   const [showRemote, setShowRemote] = useState(false);
+  const [showProjector, setShowProjector] = useState(false);
   const [customMedia, setCustomMedia] = useState("C:\\videos\\promo_verano.mp4");
   const [customVolume, setCustomVolume] = useState(screen.volume || 80);
   const [syncLead, setSyncLead] = useState(8);
@@ -523,6 +526,23 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
             <span>Control Total</span>
           </button>
 
+          {/* Proyector: comparte la pantalla del operador con la TV (Bloque 5) */}
+          <button
+            onClick={() => setShowProjector(true)}
+            disabled={!isOnline || !isAdmin}
+            className="mt-2 w-full flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl font-semibold text-xs bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white transition-all active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none border border-emerald-400/40 shadow-lg shadow-emerald-950/60"
+            title={
+              !isAdmin
+                ? "Solo administradores"
+                : !isOnline
+                  ? "La pantalla debe estar online para recibir la emisión"
+                  : "Compartir tu pantalla en la TV por streaming (WHIP → MediaMTX)"
+            }
+          >
+            <Cast className="w-4 h-4" />
+            <span>Proyector (compartir pantalla)</span>
+          </button>
+
           {/* Menú desplegable para archivo o volumen */}
           <div className="mt-2.5">
             <button
@@ -641,6 +661,15 @@ export function ScreenCard({ screen, onSuccess, onError }: ScreenCardProps) {
         screenId={screen.id}
         screenName={screen.name}
         onClose={() => setShowRemote(false)}
+        onSuccess={onSuccess}
+        onError={onError}
+      />
+
+      <ProjectorModal
+        open={showProjector}
+        screenId={screen.id}
+        screenName={screen.name}
+        onClose={() => setShowProjector(false)}
         onSuccess={onSuccess}
         onError={onError}
       />

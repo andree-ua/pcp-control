@@ -87,6 +87,25 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
     private Guid _playlistSession;
     private int _playlistGeneration;
 
+    // ── Proyector (Bloque 5) ─────────────────────────────────────────────────
+    // El panel publica su pantalla por WHIP a MediaMTX y el agente reproduce el
+    // stream por RTSP (o HLS como respaldo) con caché baja. El bucle de
+    // reconexión tolera que la publicación tarde un par de segundos en estar lista.
+    private readonly object _streamLock = new();
+    private CancellationTokenSource? _streamCts;
+    private Guid _streamSession = Guid.Empty;
+    private string? _streamPrimaryUrl;
+    private string? _streamFallbackUrl;
+    private int _streamVolume = 80;
+    private int _streamBufferMs = 400;
+    private string _streamTitle = "proyector";
+    private string? _streamServerSessionId;
+    private bool _streamActive;
+    private bool _streamLoopRunning;
+
+    private const int StreamFallbackAfterAttempts = 4;
+    private const int StreamMaxReconnectAttempts = 40;
+
     public string CurrentMedia => _currentMedia;
     public int Volume => _volume;
     public bool IsPlaying => _mediaPlayer?.IsPlaying ?? false;
@@ -255,6 +274,14 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
                 return;
             }
 
+            // En una emisión el fin (o el corte) lo gestiona el bucle de reconexión.
+            if (IsStreamActive)
+            {
+                _hasMedia = false;
+                ApplyWindowMode();
+                return;
+            }
+
             // Sin loop el medio termina: vuelve a reposo y el kiosco deja de ser TopMost.
             _currentMedia = "idle";
             _hasMedia = false;
@@ -264,6 +291,7 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
         player.EncounteredError += (s, e) =>
         {
             _hasMedia = false;
+            // El bucle de la emisión detecta el corte y reintenta la conexión.
             ApplyWindowMode();
         };
     }
@@ -380,6 +408,9 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
             AgentLog.Warn("[PLAYLIST] La playlist no tiene elementos válidos.");
             return false;
         }
+
+        // Una playlist sustituye a la emisión del proyector.
+        StopStreamState();
 
         Guid session;
 
@@ -583,12 +614,378 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
         }
     }
 
+    // ══ Proyector (Bloque 5) ═════════════════════════════════════════════════
+
+    /// <summary>Indica si hay una emisión de proyector activa (reproduciendo o reconectando).</summary>
+    public bool IsStreamActive
+    {
+        get
+        {
+            lock (_streamLock)
+            {
+                return _streamActive;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reproduce la emisión publicada en MediaMTX. La URL principal suele ser RTSP
+    /// con credenciales y <paramref name="fallbackUrl"/> HLS. La reproducción se
+    /// reintenta en segundo plano: el panel puede tardar unos segundos en publicar.
+    /// </summary>
+    public ProjectorStreamResult PlayStream(
+        string streamUrl,
+        string? fallbackUrl,
+        int volume,
+        int bufferMs,
+        string? title = null,
+        string? sessionId = null)
+    {
+        if (string.IsNullOrWhiteSpace(streamUrl))
+        {
+            return new ProjectorStreamResult
+            {
+                Started = false,
+                Detail = "La orden de proyección no incluye una URL de emisión."
+            };
+        }
+
+        if (_libVLC == null || _mediaPlayer == null)
+        {
+            return new ProjectorStreamResult
+            {
+                Started = false,
+                Detail = "LibVLC no está disponible en este agente (modo degradado)."
+            };
+        }
+
+        // Una emisión reemplaza cualquier playlist en curso.
+        StopPlaylistState();
+
+        Guid session;
+        string primary;
+
+        lock (_streamLock)
+        {
+            CancelStreamLocked();
+
+            _streamCts = new CancellationTokenSource();
+            session = Guid.NewGuid();
+            _streamSession = session;
+            _streamPrimaryUrl = streamUrl.Trim();
+            _streamFallbackUrl = string.IsNullOrWhiteSpace(fallbackUrl) ? null : fallbackUrl.Trim();
+            _streamVolume = Math.Clamp(volume, 0, 100);
+            _streamBufferMs = Math.Clamp(bufferMs <= 0 ? 400 : bufferMs, 100, 3000);
+            _streamTitle = string.IsNullOrWhiteSpace(title) ? "proyector" : title.Trim();
+            _streamServerSessionId = sessionId;
+            _streamActive = true;
+            _streamLoopRunning = false;
+            primary = _streamPrimaryUrl;
+        }
+
+        _currentMedia = $"stream: {_streamTitle}";
+        _ = Task.Run(() => RunStreamLoopAsync(session, 0));
+        ApplyWindowMode();
+
+        var protocol = DescribeStreamProtocol(primary);
+        AgentLog.Info(
+            $"[PROJECTOR] Emisión '{_streamTitle}' ({protocol}, caché {_streamBufferMs} ms). " +
+            $"Reintentos activos hasta que el publicador esté listo.");
+
+        return new ProjectorStreamResult
+        {
+            Started = true,
+            Protocol = protocol,
+            Detail = $"Emisión '{_streamTitle}' iniciada por {protocol} (caché {_streamBufferMs} ms)."
+        };
+    }
+
+    /// <summary>
+    /// Detiene la emisión del proyector y vuelve a reposo. Si se indica la sesión,
+    /// una orden de cierre antigua no detiene una emisión nueva.
+    /// </summary>
+    public void StopStream(string? sessionId = null)
+    {
+        bool wasActive;
+
+        lock (_streamLock)
+        {
+            if (!string.IsNullOrEmpty(sessionId) &&
+                (!_streamActive ||
+                 !string.Equals(_streamServerSessionId, sessionId, StringComparison.Ordinal)))
+            {
+                return;
+            }
+
+            wasActive = _streamActive;
+            CancelStreamLocked();
+            _streamServerSessionId = null;
+            _currentMedia = "idle";
+        }
+
+        _hasMedia = false;
+
+        try
+        {
+            _mediaPlayer?.Stop();
+        }
+        catch (Exception ex)
+        {
+            AgentLog.Warn($"[PROJECTOR] No se pudo detener el reproductor: {ex.Message}");
+        }
+
+        ApplyWindowMode();
+
+        if (wasActive)
+        {
+            AgentLog.Info("[PROJECTOR] Emisión detenida: el kiosco vuelve a reposo.");
+        }
+    }
+
+    /// <summary>
+    /// Cancela el estado de proyección sin parar el reproductor. Se usa cuando otra
+    /// orden (play, playlist, sync-play) va a sustituir el medio actual.
+    /// </summary>
+    private void StopStreamState()
+    {
+        lock (_streamLock)
+        {
+            CancelStreamLocked();
+        }
+    }
+
+    /// <summary>Debe llamarse con <see cref="_streamLock"/> tomado.</summary>
+    private void CancelStreamLocked()
+    {
+        _streamActive = false;
+        _streamSession = Guid.Empty;
+        _streamServerSessionId = null;
+        _streamLoopRunning = false;
+
+        try
+        {
+            _streamCts?.Cancel();
+        }
+        catch
+        {
+            // El token ya estaba cancelado o el bucle había terminado.
+        }
+
+        // No se libera el CTS aquí: el bucle puede seguir observando su token.
+        _streamCts = null;
+    }
+
+    private bool IsStreamSessionActive(Guid session)
+    {
+        lock (_streamLock)
+        {
+            return _streamActive && _streamSession == session;
+        }
+    }
+
+    /// <summary>
+    /// Bucle de conexión y reconexión de la emisión. Intenta RTSP y, si no arranca
+    /// tras varios intentos, prueba el respaldo HLS. No se solapan dos bucles.
+    /// </summary>
+    private async Task RunStreamLoopAsync(Guid session, int initialDelayMs)
+    {
+        CancellationToken token;
+
+        lock (_streamLock)
+        {
+            if (!_streamActive || _streamSession != session || _streamLoopRunning)
+            {
+                return;
+            }
+
+            _streamLoopRunning = true;
+            token = _streamCts?.Token ?? CancellationToken.None;
+        }
+
+        try
+        {
+            if (initialDelayMs > 0)
+            {
+                await Task.Delay(initialDelayMs, token);
+            }
+
+            var attempt = 0;
+
+            while (!token.IsCancellationRequested && IsStreamSessionActive(session))
+            {
+                attempt++;
+
+                string? url;
+                int volume;
+                int buffer;
+
+                lock (_streamLock)
+                {
+                    url = attempt > StreamFallbackAfterAttempts
+                        ? _streamFallbackUrl ?? _streamPrimaryUrl
+                        : _streamPrimaryUrl;
+                    volume = _streamVolume;
+                    buffer = _streamBufferMs;
+                }
+
+                if (string.IsNullOrWhiteSpace(url))
+                {
+                    return;
+                }
+
+                var fallback = attempt > StreamFallbackAfterAttempts;
+                StartStreamMedia(url, volume, buffer);
+
+                // Margen para que LibVLC negocie y empiece a decodificar.
+                await Task.Delay(1500, token);
+
+                if (!IsStreamSessionActive(session))
+                {
+                    return;
+                }
+
+                if (IsPlayerShowingMedia())
+                {
+                    AgentLog.Info(
+                        $"[PROJECTOR] Reproduciendo por {(fallback ? "HLS (respaldo)" : "RTSP")}: " +
+                        $"{DescribeStreamProtocol(url)} (intento {attempt}).");
+
+                    attempt = 0;
+                    await MonitorStreamAsync(session, token);
+
+                    if (!IsStreamSessionActive(session))
+                    {
+                        return;
+                    }
+
+                    AgentLog.Warn("[PROJECTOR] La emisión se cortó: reconectando...");
+                    await Task.Delay(1000, token);
+                    continue;
+                }
+
+                if (attempt == 1)
+                {
+                    AgentLog.Warn(
+                        $"[PROJECTOR] El stream aún no está disponible en {DescribeStreamProtocol(url)}. " +
+                        "Se reintentará hasta que el panel publique.");
+                }
+
+                if (attempt >= StreamMaxReconnectAttempts)
+                {
+                    AgentLog.Error("[PROJECTOR] Se agotaron los intentos de conexión con MediaMTX.");
+                    return;
+                }
+
+                await Task.Delay(1500, token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Emisión detenida por el panel o reemplazada por otra orden.
+        }
+        catch (Exception ex)
+        {
+            AgentLog.Error($"[PROJECTOR] Error en el bucle de emisión: {ex.Message}");
+        }
+        finally
+        {
+            lock (_streamLock)
+            {
+                if (_streamSession == session)
+                {
+                    _streamLoopRunning = false;
+                }
+            }
+        }
+    }
+
+    /// <summary>Espera mientras el reproductor muestra la emisión; retorna si se corta.</summary>
+    private async Task MonitorStreamAsync(Guid session, CancellationToken token)
+    {
+        while (!token.IsCancellationRequested && IsStreamSessionActive(session))
+        {
+            await Task.Delay(1000, token);
+
+            if (!IsPlayerShowingMedia())
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Un reproductor pausado sigue mostrando la emisión: no debe reconectarse.
+    /// Solo se reintenta cuando el estado es Ended, Stopped o Error.
+    /// </summary>
+    private bool IsPlayerShowingMedia()
+    {
+        if (_mediaPlayer == null)
+        {
+            return false;
+        }
+
+        return _mediaPlayer.State is VLCState.Playing or VLCState.Buffering or VLCState.Paused;
+    }
+
+    /// <summary>Carga la URL en LibVLC con las opciones de baja latencia del kiosco.</summary>
+    private bool StartStreamMedia(string url, int volume, int bufferMs)
+    {
+        if (_libVLC == null || _mediaPlayer == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            {
+                AgentLog.Error($"[PROJECTOR] URL de emisión inválida: {url}");
+                return false;
+            }
+
+            var media = new Media(_libVLC, uri);
+
+            // Caché baja en red y en vivo: el objetivo es que la TV vaya pegada al panel.
+            media.AddOption($":network-caching={bufferMs}");
+            media.AddOption($":live-caching={bufferMs}");
+            media.AddOption($":file-caching={bufferMs}");
+            media.AddOption(":clock-jitter=0");
+            media.AddOption(":clock-synchro=0");
+            media.AddOption(":drop-late-frames");
+            media.AddOption(":skip-frames");
+
+            // RTSP sobre TCP evita el vídeo corrupto típico de UDP con pérdidas.
+            if (uri.Scheme is "rtsp" or "rtsps")
+            {
+                media.AddOption(":rtsp-tcp");
+            }
+
+            _mediaPlayer.Media = media;
+            _mediaPlayer.Volume = Math.Clamp(volume, 0, 100);
+            _mediaPlayer.Play();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AgentLog.Error($"[PROJECTOR] No se pudo cargar la emisión: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static string DescribeStreamProtocol(string url)
+        => Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            ? uri.Scheme.ToLowerInvariant()
+            : "desconocido";
+
     /// <summary>
     /// Carga el medio en LibVLC y lo reproduce. Un <paramref name="startOffsetSeconds"/>
     /// mayor que cero hace que el demuxer empiece en ese punto (compensación de retraso).
     /// </summary>
     private bool StartMedia(string mediaPath, bool loop, int volume, double startOffsetSeconds)
     {
+        // Cualquier reproducción normal sustituye a la emisión del proyector.
+        StopStreamState();
+
         _volume = Math.Clamp(volume, 0, 100);
         _currentMedia = mediaPath;
 
@@ -686,6 +1083,7 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
     /// </summary>
     public void Stop()
     {
+        StopStreamState();
         StopPlaylistState();
 
         _currentMedia = "idle";
@@ -1031,7 +1429,11 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
         using (var fontSub = new Font("Segoe UI", 9, FontStyle.Regular))
         using (var brushSub = new SolidBrush(Color.FromArgb(148, 163, 184)))
         {
-            var statusText = currentMedia == "idle" ? "EN REPOSO (STANDBY)" : $"PAUSADO: {Path.GetFileName(currentMedia)}";
+            var statusText = currentMedia == "idle"
+                ? "EN REPOSO (STANDBY)"
+                : currentMedia.StartsWith("stream:", StringComparison.OrdinalIgnoreCase)
+                    ? $"EMISIÓN: {currentMedia[7..].Trim()}"
+                    : $"PAUSADO: {Path.GetFileName(currentMedia)}";
             var size = g.MeasureString(statusText, fontSub);
             g.DrawString(statusText, fontSub, brushSub, (width - size.Width) / 2, 65);
         }
@@ -1064,6 +1466,7 @@ public class VlcPlayerManager : IKioskWindowController, IDisposable
 
         try
         {
+            StopStreamState();
             StopPlaylistState();
 
             _mediaPlayer?.Stop();
@@ -1106,4 +1509,19 @@ public sealed class SyncPlayResult
 
     /// <summary>Segundos de salto aplicados al medio para recuperar el retraso.</summary>
     public double StartOffsetSeconds { get; init; }
+}
+
+/// <summary>
+/// Resultado de aceptar una emisión de proyector en el reproductor.
+/// </summary>
+public sealed class ProjectorStreamResult
+{
+    /// <summary>False si no hay LibVLC o la orden venía sin URL.</summary>
+    public bool Started { get; init; }
+
+    /// <summary>Protocolo principal ("rtsp", "rtsps", "http", "https").</summary>
+    public string Protocol { get; init; } = "rtsp";
+
+    /// <summary>Detalle para el operador y el CommandResult/ProjectorStatus.</summary>
+    public string Detail { get; init; } = string.Empty;
 }

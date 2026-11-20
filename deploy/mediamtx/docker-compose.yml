@@ -1,0 +1,60 @@
+name: pcp-mediamtx
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MediaMTX del proyector PCP (Bloque 5), listo para un servidor cloud.
+#
+# Arranque:
+#   cp .env.example .env      # edita PCP_AUTH_URL y PUBLIC_HOST
+#   docker compose up -d --build
+#
+# En Oracle Cloud Free Tier, usa el script automático:
+#   sudo bash setup-oracle-cloud.sh --server-url https://TU-SERVIDOR.onrender.com
+# ═══════════════════════════════════════════════════════════════════════════
+
+services:
+  mediamtx:
+    build:
+      context: .
+      args:
+        MEDIAMTX_VERSION: ${MEDIAMTX_VERSION:-1.21.4}
+    image: pcp-mediamtx:${MEDIAMTX_VERSION:-1.21.4}
+    container_name: pcp-mediamtx
+    restart: unless-stopped
+
+    ports:
+      # RTSP: lo consume el agente (Pcp.Agent) con caché baja.
+      - "8554:8554/tcp"
+      # WHIP/WHEP: el panel publica aquí la pantalla del operador.
+      - "8889:8889/tcp"
+      # ICE/WebRTC (UDP). Sin este puerto el WHIP nunca conecta.
+      - "8189:8189/udp"
+      # HLS: respaldo del agente y diagnóstico desde un navegador/VLC.
+      - "8888:8888/tcp"
+      # API de MediaMTX: solo loopback, para diagnóstico local.
+      - "127.0.0.1:9997:9997/tcp"
+
+    environment:
+      MTX_LOGLEVEL: ${MTX_LOGLEVEL:-info}
+
+      # URL del endpoint de autorización del Pcp.Server. En el cloud es la URL
+      # pública de Render; en local, el servidor del host.
+      MTX_AUTHHTTPADDRESS: ${PCP_AUTH_URL:-http://host.docker.internal:5000/api/projector/auth}
+
+      # IP pública (o host) que MediaMTX anuncia al navegador en los candidatos
+      # ICE. En Oracle debe ser la IP pública de la instancia, NO la 10.x.
+      MTX_WEBRTCADDITIONALHOSTS: ${PUBLIC_HOST:-127.0.0.1}
+
+      # En local interesa anunciar también la IP de la LAN; en cloud, solo la
+      # pública (la 10.x no es alcanzable desde el navegador).
+      MTX_WEBRTCIPSFROMINTERFACES: ${WEBRTC_IPS_FROM_INTERFACES:-true}
+
+    extra_hosts:
+      # Permite que el contenedor consulte el endpoint de autorización del
+      # Pcp.Server cuando ambos corren en la misma máquina (solo desarrollo).
+      - "host.docker.internal:host-gateway"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,20 @@
+# HTTPS para el WHIP del proyector (solo con docker-compose.tls.yml).
+# El dominio se inyecta desde la variable PCP_DOMAIN del compose.
+#
+# Requisitos:
+#   - DNS A del dominio apuntando a la IP pública de la instancia.
+#   - Puertos 80/tcp y 443/tcp abiertos en OCI y en iptables.
+#
+# Caddy obtiene y renueva el certificado de Let's Encrypt automáticamente.
+
+{$PCP_DOMAIN} {
+    encode zstd gzip
+
+    # MediaMTX escucha el handshake WHIP en 8889 dentro del mismo host.
+    reverse_proxy 127.0.0.1:8889
+
+    log {
+        output stdout
+        format console
+    }
+}

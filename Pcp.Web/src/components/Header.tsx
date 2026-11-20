@@ -27,7 +27,7 @@ export function Header({ connectionStatus, onRefresh, isLoading }: HeaderProps) 
             <h1 className="text-lg font-bold text-white tracking-tight flex items-center gap-2">
               PCP
               <span className="text-xs px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-300 font-medium border border-zinc-700">
-                Fase 3
+                Fase 5
               </span>
             </h1>
             <p className="text-xs text-zinc-400">Panel de Control de Pantallas</p>

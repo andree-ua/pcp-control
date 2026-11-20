@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import * as signalR from "@microsoft/signalr";
 import { CommandResultDto, ScreenInfo, ThumbnailDto, ToastMessage } from "@/types/screen";
 import { FileUploadProgress } from "@/types/files";
+import { ProjectorStatusDto } from "@/types/projector";
 import { fetchScreens, SERVER_URL } from "@/services/api";
 import { publishUploadProgress } from "@/services/uploadProgress";
 
@@ -101,6 +102,17 @@ export function useScreensSignalR() {
     // Progreso real del tramo servidor -> agente durante una subida de archivos
     connection.on("FileUploadProgress", (progress: FileUploadProgress) => {
       publishUploadProgress(progress);
+    });
+
+    // Estado de la emisión del proyector: solo se avisa al panel si el agente falla.
+    connection.on("ProjectorStatusReceived", (status: ProjectorStatusDto) => {
+      if (!status.success) {
+        addToast(
+          "Proyector",
+          `Pantalla [${status.screenId}]: ${status.detail || "la emisión se detuvo."}`,
+          "error"
+        );
+      }
     });
 
     // Escuchar resultados de comandos

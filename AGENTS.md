@@ -1,7 +1,7 @@
 # AGENTS.md — PCP (Panel de Control de Pantallas)
 
 Mapa de arquitectura y reglas de negocio del proyecto. **Léelo antes de tocar código.**
-Última actualización: 2026-11-20 (Fase 0–3 completas + Bloque 1: JWT, roles y login del panel + Bloque 2: Wake-on-LAN operativo con relay entre agentes y encendido masivo por grupo + Bloque 3: sincronización de reproducción con reloj del servidor + Bloque 4: playlists y programación de horarios).
+Última actualización: 2026-11-20 (Fase 0–3 completas + Bloque 1: JWT, roles y login del panel + Bloque 2: Wake-on-LAN operativo con relay entre agentes y encendido masivo por grupo + Bloque 3: sincronización de reproducción con reloj del servidor + Bloque 4: playlists y programación de horarios + Bloque 5: proyector en directo con MediaMTX, WHIP desde el panel y RTSP en el agente).
 
 ---
 
@@ -48,12 +48,22 @@ C:\Proyectos\Pcp\
 │     ├─ WolDtos.cs           ← payload/resultado de Wake-on-LAN
 │     ├─ TimeDtos.cs          ← hora del servidor y reproducción sincronizada
 │     ├─ PlaylistDtos.cs      ← playlists, reproducción y horarios (Bloque 4)
-│     └─ RemoteControlDtos.cs ← sesiones VNC (petición de túnel, estado, respuesta REST)
+│     ├─ RemoteControlDtos.cs ← sesiones VNC (petición de túnel, estado, respuesta REST)
+│     └─ ProjectorDtos.cs     ← proyector (eventos SignalR, payload, sesión WHIP/RTSP) (Bloque 5)
 ├─ scripts\publish-agent.ps1  ← publish single-file + ZIP de despliegue
 ├─ deploy\                    ← instalador zero-touch para los sticks
 │  ├─ install.bat / install.ps1 ← TightVNC + copia + tarea programada
 │  ├─ uninstall.ps1
 │  └─ appsettings.template.json
+├─ deploy\mediamtx\           ← MediaMTX del proyector (Bloque 5) listo para cloud
+│  ├─ Dockerfile              ← imagen autónoma (MediaMTX + mediamtx.yml)
+│  ├─ docker-compose.yml      ← contenedor y puertos (8889/tcp, 8189/udp, 8554/tcp)
+│  ├─ docker-compose.tls.yml  ← overlay opcional con Caddy (HTTPS para WHIP)
+│  ├─ Caddyfile               ← proxy HTTPS → 127.0.0.1:8889
+│  ├─ setup-oracle-cloud.sh   ← instalador de un clic para Oracle Free Tier
+│  ├─ .env.example            ← variables del compose (auth, IP pública)
+│  ├─ mediamtx.yml            ← auth delegada a /api/projector/auth y protocolos
+│  └─ README.md               ← guía Oracle Free Tier, puertos y diagnóstico
 ├─ .env.example               ← variables de producción (servidor/agente)
 ├─ .config\dotnet-tools.json  ← dotnet-ef 8.0.34 fijado
 ├─ Pcp.Server\                ← ASP.NET Core 8 + SignalR + EF Core (MySQL prod / SQLite dev)
@@ -78,6 +88,10 @@ C:\Proyectos\Pcp\
 │  ├─ Services\ScheduleTime.cs        ← días ISO, "HH:mm" y zona horaria
 │  ├─ Services\NetworkData.cs         ← normalización de MAC/IP/CIDR y broadcast dirigido
 │  ├─ Services\VncSessionManager.cs   ← sesiones VNC y puente WS panel ↔ agente
+│  ├─ Controllers\ProjectorController.cs ← sesión de proyector, orden al agente y auth de MediaMTX (Bloque 5)
+│  ├─ Services\ProjectorSessionManager.cs ← sesiones en memoria, tokens y autorización de MediaMTX
+│  ├─ Services\ProjectorHealthService.cs ← sonda WHIP/RTSP antes de ordenar (fail-safe)
+│  ├─ Services\ProjectorHealthMonitorService.cs ← cierra la emisión si MediaMTX cae
 │  ├─ Controllers\TimeController.cs   ← GET /api/time (referencia de reloj para los agentes)
 │  ├─ Controllers\PlaylistsController.cs  ← CRUD de playlists y reproducción
 │  ├─ Controllers\SchedulesController.cs  ← CRUD de horarios y ejecución manual
@@ -107,6 +121,7 @@ C:\Proyectos\Pcp\
    ├─ src\app\globals.css
    ├─ src\components\         ← Header, SummaryBar, ScreenCard, Toast, FileExplorerModal,
    │                            GroupCard, SystemActionsMenu, RemoteDesktopModal (noVNC),
+   │                            ProjectorModal (WHIP + getDisplayMedia, Bloque 5),
    │                            PlaylistEditor, PlaylistCard, ScheduleForm, ScheduleCard
    ├─ src\hooks\useScreensSignalR.ts  ← estado global + conexión SignalR
    ├─ src\services\api.ts     ← fetch REST (URL desde env)
@@ -115,6 +130,7 @@ C:\Proyectos\Pcp\
    ├─ src\types\group.ts      ← tipos TS de grupos
    ├─ src\types\playlist.ts   ← tipos TS de playlists
    ├─ src\types\schedule.ts   ← tipos TS de horarios y etiquetas de días
+   ├─ src\types\projector.ts  ← tipos TS de la sesión de proyector (Bloque 5)
    ├─ src\types\novnc.d.ts    ← declaraciones mínimas de @novnc/novnc
    ├─ .env / .env.local       ← desarrollo: NEXT_PUBLIC_API_URL=http://localhost:5000
    ├─ .env.production         ← build de producción: dominio real con HTTPS
@@ -243,6 +259,25 @@ Reglas del control remoto:
 - La sesión caduca a los **90 s** si el panel no abre el WebSocket; máximo absoluto **12 h**.
 - El servidor no toca el escritorio del agente: retransmite bytes entre dos WebSockets.
 
+### REST — Proyector / streaming (`Controllers/ProjectorController.cs`)
+
+| Método | Ruta | Comportamiento |
+|---|---|---|
+| POST | `/api/screens/{id}/projector/start` | Prepara una sesión efímera y devuelve `{ sessionId, streamPath, whipUrl, whipToken, rtspUrl, hlsUrl, bufferMs, volume, expiresInSeconds }`. **No** ordena nada al agente todavía. Solo `Admin`. Errores: 404 pantalla inexistente, 400 offline, 409 emisión ya activa, 503 proyector deshabilitado. |
+| POST | `/api/screens/{id}/projector/live` | Confirma que el WHIP ya publica, marca la sesión como live (hasta 12 h) y envía `OpenProjector` al agente con la URL RTSP y el respaldo HLS. Espera hasta 20 s el `ProjectorStatus`. Errores: 404 sin sesión, 400 sin conexión, 502 el agente no reproduce, 504 sin confirmación. |
+| POST | `/api/screens/{id}/projector/stop` | Cierra la sesión (o la indicada en `{ sessionId }`), envía `CloseProjector` y devuelve `{ status: "closed" }`. Idempotente (204 si no hay sesión). |
+| GET | `/api/screens/{id}/projector` | Estado de la sesión: `{ active, sessionId, streamPath, isLive, detail, expiresAt }`. |
+| POST | `/api/projector/auth` | **Anónimo**. Lo llama MediaMTX por cada `publish`/`read`: valida la ruta `pcp/<screenId>` y el token (publicación vs lectura). Responde 200/401. Si `Projector:AuthKey` está definida, exige `?key=`. |
+
+Reglas del proyector (Bloque 5):
+- El servidor **no transporta vídeo**: solo crea tokens efímeros (192 bits, en memoria), construye URLs y coordina los eventos del Hub.
+- **Fail-safe**: antes de crear una sesión (`/start`) y antes de ordenar `OpenProjector` (`/live`) se sondea MediaMTX (HTTP al WHIP + TCP al RTSP). Si no responde, se devuelve **503** `"Servidor de Streaming no disponible"`, el agente no recibe la orden y el panel muestra el error. Mientras hay emisión, `ProjectorHealthMonitorService` revisa cada 20 s y tras 2 fallos cierra la sesión (`CloseProjector` → agente a `idle`) y emite `ProjectorStatusReceived` con el motivo.
+- `Projector:HealthCheckEnabled=false` desactiva todo el fail-safe (solo para desarrollo sin MediaMTX).
+- `Projector:PublicWhipBaseUrl` debe ser **HTTPS** si el panel se sirve por HTTPS; de lo contrario el navegador bloquea el WHIP por contenido mixto. El despliegue recomendado (Oracle Free Tier + Caddy/DuckDNS) está en `deploy/mediamtx/README.md`.
+- El panel publica con WHIP y avisa a `/live`; el agente lee RTSP con `?token=` y usa HLS como respaldo (con `Authorization: Basic` en la URL).
+- La sesión caduca a los `PublisherGraceSeconds` (300 s) si el panel nunca publica, y a las `SessionMaxHours` (12 h) una vez live. Al cerrar el modal, desconectarse el agente o expirar, el servidor envía `CloseProjector`.
+- La ruta se sanea (`pcp/<screenId>` → caracteres no seguros a `_`) y es única por pantalla.
+
 ### REST — Autenticación (`Controllers/AuthController.cs`)
 
 | Método | Ruta | Comportamiento |
@@ -292,18 +327,25 @@ Reglas de autenticación:
 | `SendThumbnail(ThumbnailDto)` | Guarda el último Base64 en `ConcurrentDictionary` estático (memoria, nunca en BD) y emite `ThumbnailReceived(dto)` al panel. |
 | `FileResult(FileResultDto)` | Completa la petición pendiente del `FileRequestManager` correlacionada por `RequestId`. |
 | `VncTunnelStatus(VncTunnelStatusDto)` | Reporta si el agente abrió el túnel VNC; resuelve la espera del endpoint `remote/start`. |
+| `ProjectorStatus(ProjectorStatusDto)` | Reporta si el agente abrió o cerró la emisión; resuelve la espera de `projector/live` y retransmite `ProjectorStatusReceived` al panel. |
 
 **Eventos servidor → panel** (nombres exactos, usados por el frontend):
 `ScreenStatusChanged(screenId, status)`, `HeartbeatReceived(screenInfo)`,
-`ThumbnailReceived(dto)`, `CommandResultReceived(dto)`, `FileUploadProgress(dto)`.
+`ThumbnailReceived(dto)`, `CommandResultReceived(dto)`, `FileUploadProgress(dto)`,
+`ProjectorStatusReceived(dto)`.
 **Evento servidor → agente**: `SendCommandToAgent(commandDto)`, `FileRequest(fileRequestDto)`,
-`OpenVncTunnel(vncTunnelRequestDto)` y `CloseVncTunnel(sessionId)`.
-**Evento agente → servidor**: `FileResult(fileResultDto)`, `VncTunnelStatus(statusDto)`.
+`OpenVncTunnel(vncTunnelRequestDto)`, `CloseVncTunnel(sessionId)`,
+`OpenProjector(projectorCommandPayload)` y `CloseProjector(sessionId)`.
+**Evento agente → servidor**: `FileResult(fileResultDto)`, `VncTunnelStatus(statusDto)`,
+`ProjectorStatus(statusDto)`.
 
 ### Servicios
 - `ScreenConnectionManager`: diccionarios `ConcurrentDictionary` bidireccionales `screenId↔connectionId`. Singleton. Solo memoria: se pierde al reiniciar el servidor (los agentes reconectan).
 - `OfflineCheckerService`: cada **10 s** busca pantallas `online` con `LastHeartbeat < UtcNow - 30 s`, las marca `offline`, guarda y emite `ScreenStatusChanged`.
 - `VncSessionManager`: sesiones VNC en memoria (`sessionId`, `screenId`, contraseña RFB, secreto de agente, sockets panel/agente), emparejamiento de los dos WebSockets, bombeo bidireccional y limpieza. Un `Timer` cierra sesiones caducadas cada 10 s. Singleton con `IHubContext<ScreenHub>` para avisar al agente del cierre.
+- `ProjectorSessionManager` (Bloque 5): sesiones de proyector en memoria con token de publicación y de lectura, ruta `pcp/<screenId>`, caducidad de gracia y máximo de 12 h. Implementa la autorización que consulta MediaMTX (`publish`/`read`) y avisa al agente con `CloseProjector` al cerrar o expirar. `Fail(...)` cierra por caída del servidor de medios y transmite el fallo al panel.
+- `ProjectorHealthService` (singleton): sonda HTTP al WHIP y TCP al RTSP antes de ordenar una emisión. Cachea el resultado (`HealthCheckCacheSeconds`). Si falla, el controlador responde 503 `"Servidor de Streaming no disponible"`.
+- `ProjectorHealthMonitorService` (hosted service): cada `HealthCheckIntervalSeconds` comprueba MediaMTX mientras hay sesiones live; tras `HealthCheckFailuresBeforeClose` fallos consecutivos cierra la sesión (el agente vuelve a idle) y emite `ProjectorStatusReceived` con el motivo al panel.
 - `SyncPlayService` (scoped): fija el instante de arranque en el reloj del servidor, construye el `SyncPlayPayload` común y delega el envío en `ScreenCommandService`. Compartido por el endpoint `sync/play` y disponible para futuros comandos masivos sincronizados.
 - `PlaylistPlaybackService` (scoped): valida la playlist (elementos no vacíos), resuelve el destino (grupo o lista de pantallas) y envía un único `play-playlist` con todos los elementos y el instante de arranque. Lo usan el panel y el programador.
 - `PlaylistSchedulerService` (hosted service): cada tick busca horarios activos en su ventana horaria, evita duplicados con `LastTriggeredSlot` y lanza la playlist con el instante exacto del hueco. Respeta `Scheduling:Enabled`.
@@ -331,7 +373,7 @@ Reglas de autenticación:
 4. `ConnectWithRetryAsync`: reintenta cada 3 s hasta conectar.
 5. Tarea independiente de miniaturas cada **5 s** (más una inmediata al conectar).
 6. Bucle principal de heartbeat cada **10 s** (incluye `RemoteControlAvailable` y los datos de red para Wake-on-LAN; `NetworkInfoProvider` los refresca cada 60 s por si cambia el DHCP).
-7. Escucha `OpenVncTunnel`/`CloseVncTunnel` para el escritorio remoto.
+7. Escucha `OpenVncTunnel`/`CloseVncTunnel` para el escritorio remoto y `OpenProjector`/`CloseProjector` para la emisión del proyector (Bloque 5).
 8. Al cancelar: `StopAsync`/`DisposeAsync` del Hub, `VncRemoteControlService.StopAllAsync()` y `VlcPlayerManager.Dispose()`.
 
 ### Publicación para el stick (`scripts/publish-agent.ps1`)
@@ -398,6 +440,12 @@ Reglas de autenticación:
 
 Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) invocando `CommandResult`.
 
+### Proyector (`OpenProjector` / `CloseProjector`, Bloque 5)
+- `OpenProjector(ProjectorCommandPayload)` no pasa por la tabla `Commands`: es un evento directo del Hub. El agente llama a `VlcPlayerManager.PlayStream` y responde `ProjectorStatus` con `Success`, `Detail` y `Protocol`.
+- `PlayStream` reproduce RTSP (o HLS) con `:network-caching`/`:live-caching` = `BufferMs`, `:rtsp-tcp`, `:clock-jitter=0` y `:clock-synchro=0`; reintenta cada 1,5 s hasta que el panel publique y cambia a HLS tras 4 intentos fallidos.
+- El bucle de reconexión tolera cortes y se cancela con `CloseProjector`, `play`, `play-playlist`, `sync-play`, `stop` o el cierre del agente. El `SessionId` evita que un cierre antiguo detenga una emisión nueva.
+- La telemetría muestra `currentMedia = "stream: <título>"` y las miniaturas capturan el fotograma del stream igual que un vídeo normal.
+
 ### Telemetría (`SampleSystemMetrics`)
 - CPU: **valor aleatorio simulado** (5–30 %) — no es medición real.
 - RAM: `WorkingSet64 / GC.GetGCMemoryInfo().TotalAvailableMemoryBytes` (aprox. del proceso, no del sistema).
@@ -439,6 +487,7 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
 - `Play`: acepta `http/https/rtsp` como URL; cualquier otra cosa se trata como ruta local (`Path.GetFullPath`); loop vía `:input-repeat=-1`. Ya no hace `BringToFront` incondicional: si el kiosco está suspendido el vídeo sigue reproduciéndose minimizado y las miniaturas se capturan igual.
 - `PlaySynchronized(mediaPath, loop, volume, startAtLocalUtc)` (Bloque 3): espera de alta resolución (Task.Delay grueso + `SpinWait` final) hasta el instante ya traducido al reloj local y arranca; si la orden llegó tarde (> 75 ms), arranca inmediato y añade `:start-time` para saltar al punto que le corresponde (no se aplica a `rtsp`, que es directo). Devuelve `SyncPlayResult` (`ScheduledStartUtc`, `StartedImmediately`, `DelayMs`, `StartOffsetSeconds`), que el agente reporta en el `CommandResult`.
 - `PlayPlaylist(items, loop, volume, startAtLocalUtc?)` (Bloque 4): guarda la lista, arranca el primer elemento (o espera al instante indicado) y avanza con `EndReached` o con un `System.Threading.Timer` por `DurationSeconds`. Usa una sesión y una generación para que un temporizador viejo, un fin de vídeo simultáneo o un arranque programado anterior no muevan la lista actual. `Play`/`Stop`/`Dispose` cancelan la playlist.
+- `PlayStream(url, fallbackUrl, volume, bufferMs, title, sessionId)` (Bloque 5): reproduce la emisión del proyector con caché baja, reintenta la conexión y cambia a HLS si el RTSP no arranca. `StopStream(sessionId?)` la detiene sin afectar a una emisión más nueva.
 - Eventos `Playing/Paused/Stopped/EndReached/EncounteredError` mantienen `HasMedia` sincronizado (fin de vídeo sin loop → `idle` y sin `TopMost`).
 - `Pause`: alterna; `Stop`: idle + stop; `SetVolume`: clamp 0–100.
 - `CaptureThumbnailBase64`: si hay video, `TakeSnapshot(0, temp.jpg, 320, 180)` y devuelve `data:image/jpeg;base64,...`; si no hay video o falla, genera un JPEG sintético 320×180 de standby (fondo degradado, "PCP KIOSK", "EN REPOSO" o "PAUSADO: archivo", ID + hora, punto verde).
@@ -468,7 +517,8 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
 - `src/app/groups/page.tsx`: creación de grupos, selección de pantallas y listado.
 - `GroupCard.tsx`: edición de nombre/membresía, reproducción masiva con ruta/volumen, apagado y reinicio masivos. Incluye **Sincronizar** (ruta/volumen/margen → `POST /api/screens/sync/play` con `groupId`) y **Encender apagadas (N)**: recorre en serie solo las pantallas offline, cableadas, con MAC y WOL habilitado, y muestra un resumen por pantalla (relay usado o error) más el recuento de omitidas.
 - `RemoteDesktopModal.tsx`: modal a pantalla completa con noVNC (`@novnc/novnc/lib/rfb`, import dinámico). Pide sesión a `startRemoteSession`, muestra estado (preparando/conectando/conectado/error), permite *Solo ver*, `Ctrl+Alt+Del`, pantalla completa y reintento; al cerrar desconecta el RFB y llama a `stopRemoteSession`.
-- `ScreenCard.tsx`: botón **Control Total** (solo online) bajo Archivos/Sistema; abre `RemoteDesktopModal`.
+- `ProjectorModal.tsx` (Bloque 5): captura la pantalla del operador con `navigator.mediaDevices.getDisplayMedia` (calidad y audio configurables) y la publica a MediaMTX por **WHIP** (RTCPeerConnection + POST SDP, ICE no-trickle). Al conectar llama a `notifyProjectorLive` para que el agente reproduzca el stream; muestra vista previa, cronómetro, bitrate real (`getStats`), aviso de contenido mixto y al cerrar hace `DELETE` del recurso WHIP + `stopProjectorSession`.
+- `ScreenCard.tsx`: botón **Control Total** (solo online) bajo Archivos/Sistema; abre `RemoteDesktopModal`. Debajo, botón **Proyector (compartir pantalla)** que abre `ProjectorModal`.
 - `Header.tsx`: navegación entre `/`, `/groups` y `/playlists`.
 - `src/app/playlists/page.tsx` (Bloque 4): sección de playlists (editor + tarjetas con reproducción inmediata) y sección de programación (formulario y tarjetas de horarios). Carga `fetchPlaylists` + `fetchSchedules` y, en paralelo, `fetchGroups` para los selectores de destino.
 - `PlaylistEditor.tsx`: nombre, bucle y lista ordenada de elementos (añadir, subir/bajar, quitar, duración en segundos y volumen). Reemplaza la lista completa al guardar.
@@ -494,11 +544,13 @@ Siempre responde con `CommandResultDto` (`ok`/`error`, `Detail`, `Timestamp`) in
 - `fetchFiles(screenId, path?)`, `deleteFile(screenId, path)` y `uploadFile(screenId, directoryPath, file)`: consumen `/api/screens/{id}/files`.
 - `uploadFileWithProgress(screenId, directoryPath, file, { onBrowserProgress, signal })`: sube con `XMLHttpRequest` (progreso real navegador → servidor, cancelable con `AbortController`) y devuelve `{ clientRequestId, promise }`. El tramo servidor → agente se sigue con `subscribeUploadProgress(clientRequestId, cb)` (evento SignalR `FileUploadProgress`). `uploadFile` se mantiene como envoltorio sin progreso.
 - `startRemoteSession(screenId, viewOnly)` y `stopRemoteSession(screenId, sessionId?)`: consumen `/api/screens/{id}/remote/{start|stop}`.
+- `startProjectorSession`, `notifyProjectorLive` y `stopProjectorSession` (Bloque 5): preparan la sesión WHIP, confirman la publicación y cierran la emisión en `/api/screens/{id}/projector/*`.
 - `next.config.mjs` usa `output: "standalone"` y `npm start` respeta el `PORT` de la nube. `NEXT_PUBLIC_API_URL` es de build-time: si falta en producción, el panel cae a `http://localhost:5000` y registra un error en consola.
 
 ### Tipos — `src/types/screen.ts`
 Espejo camelCase de los DTOs: `ScreenInfo` (incluye `remoteControlAvailable`, `macAddress`, `localIp`, `wolEnabled`, `isWired`, `clockOffsetMs`, `clockSynced`), `RemoteSession`, `ThumbnailDto`, `CommandRequest`, `CommandResponse`, `CommandResultDto`, `SyncPlayRequest`, `SyncPlayResponse`, `ToastMessage`.
 `src/types/playlist.ts` (`Playlist`, `PlaylistItem`, `PlaylistUpsert`, `PlaylistPlayResponse`) y `src/types/schedule.ts` (`Schedule`, `ScheduleUpsert`, `DAY_LABELS`, `parseDays`, `describeDays`).
+`src/types/projector.ts` (`ProjectorSession`, `ProjectorActionResponse`, `ProjectorStatusResponse`, `ProjectorStatusDto`).
 `src/types/novnc.d.ts` declara la superficie mínima de `@novnc/novnc`.
 **Si cambia un DTO en `Pcp.Shared`, actualizar este archivo.**
 
@@ -528,6 +580,8 @@ Espejo camelCase de los DTOs: `ScreenInfo` (incluye `remoteControlAvailable`, `m
 20. **Diagnóstico de reloj**: el offset (`servidor - agente`) viaja en cada heartbeat y se persiste en `Screens.ClockOffsetMs`. Un valor grande (> 1–2 s) explica miniaturas con horas raras y sirve para decidir si hay que sincronizar la hora del stick con NTP.
 21. **Playlists**: una lista ordenada de medios con duración y volumen por elemento. El agente reproduce la secuencia por su cuenta y el servidor no interviene entre elementos; por eso una playlist sobrevive a la caída del servidor, pero no a un reinicio del agente (queda en `idle` hasta la siguiente orden u horario). `stop`/`play` manuales cancelan la playlist en curso.
 22. **Programación**: los horarios se evalúan en el servidor con la zona `Scheduling:TimeZone` y se disparan con 10 s de antelación; el instante de arranque que reciben los agentes es absoluto y pasa por el reloj del Bloque 3, por lo que varias pantallas de un grupo arrancan la playlist a la vez. Solo hay una instancia del programador (si se escala el servidor a varias réplicas, cada una intentaría ejecutar el horario; requiere coordinación distribuida).
+23. **Proyector**: el panel publica su pantalla por WHIP a MediaMTX y el agente la reproduce por RTSP con caché baja (HLS como respaldo). El servidor solo emite tokens efímeros y autoriza las rutas `pcp/<screenId>`; **no** transporta vídeo. Una emisión por pantalla; al cerrar el modal, caer el agente o caducar la sesión se envía `CloseProjector`. Requiere MediaMTX accesible desde el navegador (HTTPS si el panel es HTTPS) y desde la LAN de los sticks.
+24. **Permisos del proyector**: crear/cerrar sesiones y publicar exige `Admin`; un `Viewer` no ve el botón. Los tokens de publicación y lectura son distintos: un token de lectura no permite publicar en la ruta.
 
 ---
 
@@ -556,7 +610,7 @@ powershell -ExecutionPolicy Bypass -File C:\Proyectos\Pcp\scripts\publish-agent.
 ```
 
 Claves de configuración relevantes:
-- `Pcp.Server/appsettings.json` → `Database:MySqlVersion`, `ConnectionStrings:DefaultConnection` (SQLite dev), `Files:MaxUploadMb`, `Wol:*` (`Enabled`, `CooldownSeconds`, `Port`, `DirectSendEnabled`, `PreferredRelayScreenId`), `Scheduling:*` (`Enabled`, `TimeZone`, `TickSeconds`, `LeadSeconds`), `Auth:*` (emisor, audiencia, cookie, duración de tokens, usuario admin inicial).
+- `Pcp.Server/appsettings.json` → `Database:MySqlVersion`, `ConnectionStrings:DefaultConnection` (SQLite dev), `Files:MaxUploadMb`, `Wol:*` (`Enabled`, `CooldownSeconds`, `Port`, `DirectSendEnabled`, `PreferredRelayScreenId`), `Scheduling:*` (`Enabled`, `TimeZone`, `TickSeconds`, `LeadSeconds`), `Projector:*` (`Enabled`, `PathPrefix`, `PublicWhipBaseUrl`, `PublicHlsBaseUrl`, `PublicRtspUrl`, `ReadUser`, `AuthKey`, `PublisherGraceSeconds`, `SessionMaxHours`, `BufferMs`, `Volume`, `HealthCheckEnabled`, `HealthCheckTimeoutSeconds`, `HealthCheckCacheSeconds`, `HealthCheckRtsp`, `HealthCheckIntervalSeconds`, `HealthCheckFailuresBeforeClose`, `HealthCheckUrl`), `Auth:*` (emisor, audiencia, cookie, duración de tokens, usuario admin inicial).
 - `Pcp.Server/appsettings.Production.json` → `Database:Provider=MySql`, `Cors:AllowedOrigins`, `Auth:CookieSameSite=None`. La cadena real y `Auth__SigningKey` **nunca** se versionan: usar `ConnectionStrings__MySql` o `DATABASE_URL`/`MYSQL_URL`/`MYSQL_ADDON_URI`, más `Auth__SigningKey`, `Auth__AdminPassword`, `Cors__AllowedOrigins__0..N`, `PORT` y `Files__MaxUploadMb`.
 - `Pcp.Agent/appsettings.json` (opcional) → `Agent:ScreenId`, `Agent:Name`, `Agent:Token`, `Agent:ServerUrl`, `Agent:DevMode`, `Agent:AllowSystemCommands`, `Agent:SystemCommandDelaySeconds`, `Agent:FileRoots`, `Agent:ProtectedPaths`, `Agent:MaxUploadMb`, `Agent:LogPath`, `Agent:Kiosk:TopMostOnlyWhilePlaying`, `Agent:Kiosk:IdleWindowState`, `Agent:Vnc:*`, `Agent:Wol:InterfaceName` y `Agent:Wol:MacOverride` (overrides manuales de la NIC para WOL; el override por nombre selecciona esa interfaz aunque parezca virtual). Se puede omitir y usar `PCP_SERVER_URL`, `PCP_SCREEN_ID`, `PCP_SCREEN_NAME`, `PCP_TOKEN` o `PCP_Agent__*`.
 - `Pcp.Web/.env.local` (dev) y `Pcp.Web/.env.production` (build) → `NEXT_PUBLIC_API_URL` (y `NEXT_PUBLIC_SERVER_URL`).
@@ -603,6 +657,8 @@ o con `Agent:ScreenId` (appsettings/CLI).
 - El encendido masivo por grupo no tiene endpoint propio: el panel itera las pantallas en serie, así que un grupo grande tarda y no hay resumen persistido en el servidor (solo los `Commands` auditados de cada `wake`).
 - **Playlists**: no hay transiciones (fade), ni subtítulos, ni audio independiente por elemento; la duración por elemento es opcional y, si es 0, dependen del fin natural del vídeo, por lo que pantallas con códecs/tiempos distintos pueden desincronizarse a partir del segundo elemento. El agente no persiste la playlist en disco: si se reinicia, no reanuda sola.
 - **Programación**: el programador es un `BackgroundService` de una sola instancia y no hay calendario de excepciones (festivos, vacaciones) ni prioridad entre horarios solapados: si dos coinciden, se lanzan ambos y gana el último comando. No se recuperan ejecuciones perdidas si el servidor está caído durante toda la ventana. La zona horaria es global (`Scheduling:TimeZone`), no por horario.
+- **Proyector**: depende de MediaMTX (no se instala desde el panel) y de que el navegador del operador conceda `getDisplayMedia`; si el panel es HTTPS, MediaMTX debe ser HTTPS o el navegador bloquea el WHIP. La sesión del proyector vive en memoria del servidor: un reinicio corta la coordinación (el agente deja de recibir el cierre y el stream caduca por MediaMTX). No hay audio bidireccional, grabación ni selección de pista; el audio del sistema solo llega si el operador lo marca y el navegador lo permite. `Projector:AuthKey` protege el endpoint de autorización, pero MediaMTX debe poder alcanzar `Pcp.Server` (por eso `host.docker.internal` en el compose de desarrollo). En cloud, el despliegue zero-cost está en `deploy/mediamtx` (Oracle Free Tier + `setup-oracle-cloud.sh`) y la sonda de salud cierra la emisión si MediaMTX deja de responder.
+- **Proyector (alcance del fail-safe)**: la sonda comprueba MediaMTX **desde el servidor** (WHIP HTTP + RTSP TCP), no el camino real hasta cada stick. Un firewall que bloquee 8554 solo para la LAN del agente, o una pérdida de paquetes UDP, no se detecta; en ese caso el agente agota sus reintentos. Tampoco se consulta el path concreto en la API de MediaMTX (el 9997 no se expone), solo la disponibilidad global.
 
 ---
 

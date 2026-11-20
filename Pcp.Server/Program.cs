@@ -63,6 +63,11 @@ builder.Services.AddSingleton<IScreenConnectionManager, ScreenConnectionManager>
 builder.Services.AddSingleton<IFileRequestManager, FileRequestManager>();
 // Sesiones de control remoto (túnel VNC panel ↔ agente)
 builder.Services.AddSingleton<IVncSessionManager, VncSessionManager>();
+// Sesiones de proyección (Bloque 5): publica el panel por WHIP y el agente lee por RTSP/HLS.
+builder.Services.AddSingleton<IProjectorSessionManager, ProjectorSessionManager>();
+// Fail-safe del proyector: sonda MediaMTX antes de ordenar y mientras hay emisión.
+builder.Services.AddSingleton<IProjectorHealthService, ProjectorHealthService>();
+builder.Services.AddHostedService<ProjectorHealthMonitorService>();
 builder.Services.AddScoped<ScreenCommandService>();
 builder.Services.AddScoped<WakeOnLanService>();
 builder.Services.AddScoped<SyncPlayService>();
